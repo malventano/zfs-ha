@@ -1,9 +1,10 @@
 #!/bin/sh
 # zfs-ha: quiesce / rediscover HA pool devices on this host.
 #
-#   zfs-ha-quiesce delete   [pool]   remove all HA-pool devices from the OS
-#   zfs-ha-quiesce rescan   [pool]   rescan and re-add them
-#   zfs-ha-quiesce status   [pool]   report which devices are present
+#   zfs-ha-quiesce delete | rescan | status
+#
+# (The optional [pool] argument shown in older docs was never implemented -
+# the disk list always comes from pool.conf.)
 #
 # The disk list comes from /etc/zfs-ha/pool.conf (authoritative, written at
 # pool creation) - NEVER from `zpool status` at runtime (REVIEW_MODULARITY D1:

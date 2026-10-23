@@ -118,9 +118,24 @@ parse_slot() {
 }
 
 my_slot() {
-    # slot 1 = this host if its name sorts before the peer's, else 2
-    local me peer
+    # Slot assignment must be STABLE and IDENTICAL on both hosts. Comparing
+    # hostname against peer= is wrong when peer= is an IP (both hosts then
+    # compute the same slot and overwrite each other's heartbeat). init
+    # records the two node names in mailbox_nodeA/nodeB; each host finds
+    # itself by hostname. Legacy fallback (name-vs-peer comparison) only
+    # applies when init was never run with explicit node names.
+    local me a b
     me=$(hostname)
+    a=$(grep -E '^mailbox_nodeA=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)
+    b=$(grep -E '^mailbox_nodeB=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)
+    if [ -n "$a" ] && [ -n "$b" ]; then
+        if [ "$me" = "$a" ]; then echo 1
+        elif [ "$me" = "$b" ]; then echo 2
+        else die "hostname '$me' is neither mailbox_nodeA='$a' nor nodeB='$b' (re-run: zfs-ha-mailbox init)"
+        fi
+        return
+    fi
+    local peer
     peer=$(grep -E '^peer=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)
     [ -n "$peer" ] || die "no peer= in $CONF"
     if [ "$me" \< "$peer" ]; then echo 1; else echo 2; fi
@@ -148,6 +163,14 @@ cmd_init() {
         echo "mailbox=$byid" >> "$CONF"
     fi
     grep -qE '^peer=' "$CONF" 2>/dev/null || echo "peer=$nodeB" >> "$CONF"
+    # record the node names so my_slot() is deterministic on both hosts
+    if grep -qE '^mailbox_nodeA=' "$CONF" 2>/dev/null; then
+        sed -i "s|^mailbox_nodeA=.*|mailbox_nodeA=$nodeA|" "$CONF"
+        sed -i "s|^mailbox_nodeB=.*|mailbox_nodeB=$nodeB|" "$CONF"
+    else
+        echo "mailbox_nodeA=$nodeA" >> "$CONF"
+        echo "mailbox_nodeB=$nodeB" >> "$CONF"
+    fi
     echo "mailbox initialized: $byid (A=$nodeA B=$nodeB)"
 }
 

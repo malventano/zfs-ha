@@ -171,13 +171,22 @@ cmd_status() {
 }
 
 cmd_off() {
+    # Reset ONLY the phys currently affiliated to the peer's SAS address.
+    # Hard-resetting every populated phy would also drop the disks the
+    # FENCING host is actively using (its own affiliations survive a phy
+    # reset only after re-affiliation - see VALIDATION V4/V10), which is
+    # self-inflicted I/O disruption during a fence.
     local cleared=0 reset=0
     for exp in $TARGET_EXPS; do
         local phys
         phys=$(smp_discover "$exp" 2>/dev/null | grep "D:attached" | awk '{print $2}' | tr -d ':' | sed 's/D$//')
         for phy in $phys; do
-            smp_phy_control --phy="$phy" --op=2 "$exp" >/dev/null 2>&1
-            reset=$((reset+1))
+            local addr
+            addr=$(smp_rep_phy_sata --phy="$phy" "$exp" 2>/dev/null | grep "affiliated STP initiator" | awk '{print $NF}')
+            if [ "$addr" = "$PEER_SAS" ]; then
+                smp_phy_control --phy="$phy" --op=2 "$exp" >/dev/null 2>&1
+                reset=$((reset+1))
+            fi
         done
     done
     sleep 10

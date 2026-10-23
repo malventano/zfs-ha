@@ -30,7 +30,6 @@
 set -u
 
 PR_TYPE="${ZFS_HA_PR_TYPE:-5}"
-  "5a17"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 

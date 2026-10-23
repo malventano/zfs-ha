@@ -6,7 +6,8 @@ HBAs, Rocky Linux 10.2, OpenZFS 2.2.11, pacemaker 3.0.1 / corosync 3.1.10);
 the steps themselves apply to any SAS expander shelf.
 
 This how-to assumes you already have Rocky Linux installed and OpenZFS +
-Cockpit working - see my other Level1Techs how-tos for those. It covers:
+Cockpit working (there are plenty of how-tos for those; this guide starts
+where they stop). It covers:
 
 - [§1](#1-install-packages) package installs
 - [§2](#2-network) network layout
@@ -56,8 +57,9 @@ make install
 
 Notes from the reference build:
 
-- The kmod package is named `kmod-zfs`, not `zfs-kmod` - the `zfs-kmod`
-  repo provides both names. Kernel 6.12 requires ZFS ≥ 2.2.
+- The kmod package is named `kmod-zfs` (the `zfs-kmod` repo provides both
+  names; `dnf install zfs-kmod` also resolves to the kmod build). Kernel
+  6.12 requires ZFS ≥ 2.2.
 - The upstream ClusterLabs `ocf:heartbeat:ZFS` agent exists but is omitted
   from RHEL/Rocky's resource-agents build. You don't need it: this
   project's `zfsha-pool` installs as `ocf:zfsha:Pool` and is
@@ -80,6 +82,20 @@ Notes from the reference build:
   Aliases are a functional fallback, not a substitute for real redundancy:
   they share the NIC's failure domain. Use dedicated NICs for production.
   A direct 1 Gb crossover heartbeat is the cheapest real second link.
+
+- **Passwordless SSH between the hosts** (required by `zfs-ha-cutover` and
+  the peer preflight checks):
+
+  ```sh
+  ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+  ssh-copy-id <user>@<peer>          # both directions
+  # if the tooling runs under sudo, also copy the key to /root/.ssh/
+  sudo cp ~/.ssh/id_ed25519* /root/.ssh/ && sudo chown root:root /root/.ssh/id_ed25519*
+  ```
+
+  Note: sshd's per-source penalty (OpenSSH 9.8+) temporarily blocks a host
+  after repeated failed auths - always use an explicit `user@host`, and
+  never let scripts hammer ssh with bad credentials.
 
 ## 3. Cluster bring-up
 
@@ -158,17 +174,40 @@ zpool create -o multihost=on -o cachefile=/etc/zfs/zpool.cachefile.ha <POOL> \
   `zpool.cachefile`, so boot-time auto-import won't grab it.
 
 After creating the pool, record the authoritative config and generate the
-boot-time quiesce rule:
+boot-time quiesce rule. **Run this on the primary, then copy
+`/etc/zfs-ha/pool.conf` to the peer** (scp it, or let your config
+management do it) and set the per-host role:
 
 ```sh
-zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd>
+# on the primary:
+zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd> \
+    --role primary --peer <nodeB-ip-or-name>
+scp /etc/zfs-ha/pool.conf <nodeB>:/etc/zfs-ha/pool.conf
+
+# on the secondary (after copying):
+zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd> \
+    --role secondary --peer <nodeA-ip-or-name>
+
+# on both:
 zfs-ha-udevrule generate && udevadm control --reload
 ```
 
-`pool.conf` is the single source of truth for every tool. Set `role=primary`
-on the designated primary and `role=secondary` on the standby (or use
-`zfs-ha-poolconf --role --peer`), and make sure `peer=` points at the other
-host on both.
+`pool.conf` is the single source of truth for every tool. `role=` and
+`peer=` are **required** - the resource agent runs `zfs-ha-role` on every
+start, and it refuses (exit 2) without them.
+
+> [!NOTE]
+> **Role arbitration adds a delay to failover, by design.** On every pool
+> start, `zfs-ha-role` checks the peer: a *secondary-role* host waits up to
+> 180 s (`PEER_WAIT`, tunable via env) for the primary to come up before
+> importing, so two hosts booting simultaneously don't race for the disks.
+> That wait happens inside the pacemaker start action - keep the start
+> timeout at 300 s or higher (the resource template already uses 300 s).
+> A *primary-role* host starts immediately. If you want faster failovers
+> and accept the simultaneous-boot race handled purely by pacemaker +
+> fencing, lower `PEER_WAIT` (e.g. `PEER_WAIT=30 pcs resource ...` via the
+> RA's environment is not supported - edit the default in
+> `scripts/zfs-ha-role`).
 
 > [!WARNING]
 > `zpool create` can hang indefinitely on a shelf with marginal disks (it
@@ -203,6 +242,14 @@ either node until Pacemaker starts it, `zfs-ha-quiesce status` shows 0/N
 devices present, and `journalctl -t zfs-ha-udev` shows the deletions.
 `check_boot_import.sh <POOL>` runs the whole check for you.
 
+Optionally, install the boot-time posture unit as a second layer (it
+deletes all HA-pool devices before the ZFS import services run):
+
+```sh
+install -m644 configs/zfs-ha-posture.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable zfs-ha-posture.service
+```
+
 Why this matters so much: a host that boots while the peer owns the disks
 gets I/O errors against them, and mpt3sas **drops the disks from discovery
 entirely** ("sata affiliation conflict") - no sd node, no by-id link.
@@ -212,9 +259,11 @@ whole mess.
 
 ## 6. Fencing (required before production)
 
-See the fencing discussion in §12 and the options table below. The rule:
-**do not create the pool resource until fencing is configured and *tested***
-(power a node off via the fence agent and confirm the cluster recovers).
+See `docs/FENCING.md` for the full options discussion (BMC/IPMI, switched
+PDU, PiKVM, SBD, and why SAS expander isolation is not fencing), and
+§12.1c for the SCSI persistent reservation path. The rule: **do not create
+the pool resource until fencing is configured and *tested*** (power a node
+off via the fence agent and confirm the cluster recovers).
 
 Minimum viable setups by hardware path:
 
@@ -266,7 +315,10 @@ would do manually:
    for `stp`, PR release for `sas`).
 5. On the new owner: rescan + acquire - devices reappear (udev rule permits
    via allow-import flag), exclusivity evidence verified (affiliation clear
-   or reservation held), stale commands flushed (`sg_reset -d`).
+   or reservation held). If the previous owner had in-flight I/O, flush the
+   stale queued commands manually per `docs/HANDBOFF.md` (`sg_reset -d` on
+   each disk) before the import - a clean export means there is usually
+   nothing to flush.
 6. `zpool import -f` + start nfs-server - sharenfs exports follow.
 
 **Crash of the owner (SAS stack wedged, host still powered):**
@@ -276,8 +328,8 @@ would do manually:
 2. Recovery: **hard reset the disk phy** -
    `smp_phy_control --phy=<N> --op=2 /dev/bsg/expander-<h>:<id>`.
    This drops the disk's link, which releases the stale affiliation.
-3. The survivor re-affiliates automatically on its first I/O; then
-   `sg_reset -d`, verify, and import.
+3. The survivor re-affiliates automatically on its first I/O; then flush
+   the stale queued commands (`sg_reset -d` per disk), verify, and import.
 
 **Power loss of the owner:**
 1. The disk phys go down; the expander reports `STP I_T nexus loss occurred: 1`.
@@ -396,8 +448,11 @@ Honest limitations, so you know what you're buying:
 
 ## 12. Hardware setup: the three paths
 
-This is the decision that shapes everything else. All three are validated;
-they are not equally good.
+This is the decision that shapes everything else. The `stp` path and the
+controlled cutover protocol are fully validated (see `docs/VALIDATION.md`);
+the `sas`/PR path is implemented and exercised on the reference shelf but
+not yet in the formal test matrix; the `null` path is designed, not
+validated. They are not equally proven, and the docs say which is which.
 
 ### 12.1 SAS + interposers - the best setup (recommended)
 
@@ -508,7 +563,7 @@ zfs-ha-pr release <by-id>            # planned handoff: drop reservation
 zfs-ha-pr preempt <by-id> <victim-key>   # FENCED takeover from a dead owner
 ```
 
-Validated behaviour on the reference shelf:
+Exercised on the reference shelf (not yet in the formal validation record):
 
 - Peer reads succeed while the owner holds the reservation (type 5 allows
   reads); peer writes fail with `reservation conflict` in dmesg and ZFS
@@ -619,6 +674,30 @@ freshness, peer storage activity, BMC power readback - a decision is only
 made when multiple signals agree). The mailbox disk is itself a single
 point of failure, which is exactly why it is never a sole dependency. Even
 on a plain-SATA shelf, adding one SAS disk for the mailbox is worth it.
+
+Setup (both hosts, after the disk is visible to both):
+
+```sh
+# once, from either host - records the mailbox device and node names in
+# pool.conf (the node names make slot assignment deterministic):
+zfs-ha-mailbox init /dev/disk/by-id/scsi-35000c9... <nodeA-name> <nodeB-name>
+
+# heartbeat, every 2-5s (a systemd timer or a cron line):
+zfs-ha-mailbox beat
+zfs-ha-mailbox read       # dump both slots; peer slot age is the signal
+```
+
+`zfs-ha-amialone` also reads optional keys from pool.conf that enable its
+carrier and BMC signals (all optional; the gate abstains on signals it
+cannot read):
+
+```ini
+interface=enp1s0            # NIC whose carrier state is checked
+peer_sas_addr=0x500605b0... # peer HBA SAS address (affiliation signal)
+peer_bmc=10.x.x.x           # peer BMC (the only death proof)
+peer_bmc_user=...
+peer_bmc_pass=...           # pool.conf is mode 600 for this reason
+```
 
 ## 13. Witness (qnetd) and two-node quorum
 

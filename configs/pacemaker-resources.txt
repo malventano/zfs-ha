@@ -21,7 +21,7 @@
 # import and exports cleanly before release.
 #
 # pcs resource create ha_pool ocf:zfsha:Pool pool=<POOL_NAME> \
-#     op start timeout=180s op stop timeout=180s op monitor timeout=30s interval=30s
+#     op start timeout=300s op stop timeout=300s op monitor timeout=30s interval=30s
 #
 # --- VIP ---
 # pcs resource create ha_vip ocf:heartbeat:IPaddr2 ip=<VIP> nic=<VIP_NIC> cidr_netmask=24

@@ -5,12 +5,12 @@ anything, resets anything, or changes any state. They are the first thing I
 run when a disk "disappears" or a bay looks wrong, and they are what I use to
 answer "is this a disk problem or a shelf problem".
 
-Both need `sg3_utils` (and `lsscsi`) installed, plus `smp_utils` for the
+Both need `sg3_utils` installed, plus `smp_utils` for the
 topology tool. Root (or membership in a group that can read the sg devices)
 is required to read SES device nodes.
 
 ```sh
-dnf install -y sg3_utils lsscsi
+dnf install -y sg3_utils
 # smp_utils is not packaged for EL10/Rocky 10 - build it:
 dnf install -y gcc make
 curl -skL https://sg.danny.cz/sg/p/smp_utils-0.99.tgz | tar xz -C /tmp
@@ -29,6 +29,10 @@ exposes an enclosure services device - the reference shelf is a NetApp DS460C
 (IOM12), but nothing in the tool is NetApp-specific.
 
 ### Usage
+
+`make install` puts the tools on your PATH as `shelf-health` and
+`sas_topology` (in `/usr/local/bin`); the examples below use `python3
+shelf-health.py` so they work straight from a checkout.
 
 ```sh
 # formatted console output (default)
@@ -188,8 +192,8 @@ sudo sh sas_topology.sh
   expander-0:5     addr= NETAPP  Traf DCM
 
 === Disks (bay / WWN / phy / affiliation) ===
-  bay=0   end_device-0:1:0   wwn=0x50014ee2b0xxxxxx phy=0   aff=1/0x500605b00b28ed40
-  bay=1   end_device-0:1:1   wwn=0x50014ee2b0xxxxxx phy=1   aff=1/0x500605b00b28ed40
+  bay=0   end_device-0:1:0   wwn=0x50014ee2b0xxxxxx phy=0   aff(valid/initiator)=1/0x500605b00b28ed40
+  bay=1   end_device-0:1:1   wwn=0x50014ee2b0xxxxxx phy=1   aff(valid/initiator)=1/0x500605b00b28ed40
   ...
 ```
 

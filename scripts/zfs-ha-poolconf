@@ -4,7 +4,11 @@
 # the file to the peer (or let the cluster distribute it).
 #
 #   zfs-ha-poolconf write <pool> [--strategy auto|stp|sas|null] \
-#       [--fencing none|bmc|pdu|pikvm|sbd|pr] [--mailbox <by-id>]
+#       [--fencing none|bmc|pdu|pikvm|sbd|pr] [--mailbox <by-id>] \
+#       [--role primary|secondary] [--peer <addr>]
+#
+# role= and peer= are REQUIRED for cluster operation: the resource agent
+# runs zfs-ha-role on every start, and it refuses without them.
 #
 # The resulting /etc/zfs-ha/pool.conf is the single source of truth for every
 # tool (zfsha-pool, zfs-ha-quiesce, zfs-ha-doctor, posture unit). It must
@@ -102,11 +106,13 @@ TMP="$CONF.tmp.$$"
     [ -n "$MAILBOX" ] && echo "mailbox=$MAILBOX"
     [ -n "$ROLE" ] && echo "role=$ROLE"
     [ -n "$PEER" ] && echo "peer=$PEER"
+    # strict_acquire is recorded for documentation/auditing; the acquire
+    # gate itself lives in the strategy plugins (they always fail closed).
     echo "strict_acquire=yes"
 } > "$TMP"
 
 echo "$DISKS" | while read -r d; do echo "  disk: $d"; done >&2
 mv "$TMP" "$CONF"
-chmod 644 "$CONF"
-echo "wrote $CONF"
+chmod 600 "$CONF"
+echo "wrote $CONF (mode 600 - it may contain peer BMC credentials)"
 cat "$CONF"

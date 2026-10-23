@@ -12,7 +12,7 @@
 # surviving node re-affiliate on its next I/O.
 #
 # Usage: S2_crash_owner.sh <DISK_ON_SURVIVOR> <EXPANDER_BSG> <PHY_ID>
-#   e.g. S2_crash_owner.sh /dev/sdg /dev/bsg/expander-6:7 6
+#   e.g. S2_crash_owner.sh /dev/disk/by-id/wwn-0x... /dev/bsg/expander-6:7 6
 set -eu
 
 DISK="${1:?usage: $0 <DISK> <EXPANDER_BSG> <PHY>}"

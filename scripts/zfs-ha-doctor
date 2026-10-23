@@ -55,13 +55,17 @@ fi
 if [ -n "$POOL" ]; then
     total=0; present=0
     # D1 fix: disks from pool.conf (authoritative), not zpool status
-    for disk in $(grep -E '^disks=' /etc/zfs-ha/pool.conf 2>/dev/null | head -1 | cut -d= -f2- | tr ',' ' '); do
+    for disk in $(grep -E '^disks=' "${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}" 2>/dev/null | head -1 | cut -d= -f2- | tr ',' ' '); do
         total=$((total+1))
         [ -e "$(readlink -f "$disk" 2>/dev/null)" ] && present=$((present+1))
     done
     if [ "$total" -gt 0 ]; then
         note "HA devices present: $present/$total"
-        if [ "$present" -gt 0 ] && ! echo "$imported" | grep -qw "$POOL"; then
+        if [ "$present" -eq 0 ] && ! echo "$imported" | grep -qw "$POOL"; then
+            # devices quiesced (deleted), pool not imported: healthy standby
+            state="SECONDARY"
+            note "devices quiesced, pool not imported - healthy standby"
+        elif [ "$present" -gt 0 ] && ! echo "$imported" | grep -qw "$POOL"; then
             state="DIRTY"
             warn "HA devices present but pool not imported - stale posture"
             warn "run: zfs-ha-quiesce delete $POOL  (or import the pool)"

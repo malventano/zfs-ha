@@ -34,12 +34,18 @@ can do. The catch - and the reason this repo exists - is that the hard part
 depends entirely on what kind of disks are in the shelf. This project solves
 all three disk paths and documents where each one is appropriate.
 
-**Status: working, validated end-to-end on real hardware.** The disk-handoff
-primitive, the cluster stack, pacemaker resource failover, SCSI persistent
-reservation fencing, and NFS cutover via the ZFS `sharenfs` property are all
-validated on a NetApp DS460C with SATA disks. See `docs/VALIDATION.md` for
-exactly what was tested and measured, and `docs/HOWTO.md` for the full
-deployment guide.
+**Status: working, validated end-to-end on real hardware.** What the
+validation record (`docs/VALIDATION.md`) actually covers: the STP disk-handoff
+primitive (SATA affiliation release/acquire/recover, with data integrity
+checks), the cluster stack (corosync dual-ring, two-node quorum), pacemaker
+resource failover with VIP colocation, boot-time quiesce, NFS cutover via
+the ZFS `sharenfs` property (zero client gaps > 2s), and three consecutive
+full round-trips of a 4x3TB raidz1 via the controlled cutover protocol. The
+SCSI persistent reservation path (`zfs-ha-pr`, the `sas` strategy) is
+**implemented and exercised on the reference shelf** (peer writes get
+RESERVATION CONFLICT while the owner holds the reservation) but is not yet
+in the formal validation record - treat it as validated-by-exercise, not
+validated-by-test-matrix. The `null` strategy is designed, not validated.
 
 ## Why this is subtle
 
@@ -71,7 +77,7 @@ scripts/
   zfsha-pool            OCF resource agent: cluster-managed ZFS pool
                         (rescan → acquire with evidence → import on start;
                          unmount NFS → export → quiesce → release on stop)
-  zfs-ha-handoff        strategy dispatcher (strategies.d/stp|sas|null)
+  zfs-ha-handoff        strategy dispatcher (scripts/strategies/{stp,sas,null})
   zfs-ha-config         pool.conf reader/validator
   zfs-ha-poolconf       writes pool.conf (authoritative pool + disk list)
   zfs-ha-quiesce        OS-level device delete/rescan (anti-race primitive)
@@ -87,7 +93,8 @@ scripts/
                         disks, planned maintenance)
   fence_zfs_ha_stp      stonith fence agent: SAS/STP storage isolation
   check_boot_import.sh  verifies no boot-time auto-import
-  strategies.d/         stp/ sas/ null/ handoff strategy plugins
+  strategies/           stp/ sas/ null/ handoff strategy plugins
+                        (installed to /usr/lib/zfs-ha/strategies.d/)
 configs/
   pacemaker-resources.txt   resource definitions + ordering constraints
   zfs-ha-posture.service    boot-time quiesce systemd unit (template)
@@ -101,6 +108,8 @@ utils/
 docs/
   HOWTO.md              full deployment guide
   VALIDATION.md         what was tested, on what hardware, with what results
+  HANDBOFF.md           canonical handoff algorithm + operational addendum
+  FENCING.md            fencing backend options and requirements
 ```
 
 ### What the scripts do, and how the strategies fit
@@ -113,9 +122,16 @@ pool=red3t
 disks=/dev/disk/by-id/wwn-0x5000c500a1b2c3d4,/dev/disk/by-id/wwn-0x5000c500a1b2c3d5,...
 strategy=sas
 fencing=pr
-strict_acquire=yes
 role=primary
 peer=10.200.1.8
+
+# optional (zfs-ha-amialone signals; all off unless set):
+# mailbox=/dev/disk/by-id/scsi-35000c9...
+# interface=enp1s0
+# peer_sas_addr=0x500605b0...
+# peer_bmc=10.x.x.x
+# peer_bmc_user=...
+# peer_bmc_pass=...
 ```
 
 That file is the single source of truth for the pool name, the exact disks
@@ -158,7 +174,7 @@ confusion:
   a while, he's probably dead".
 
 The role is just a line in pool.conf (`role=primary` / `role=secondary`,
-plus `peer=<address>`), set by `zfs-ha-poolconf --role --peer`, and
+plus `peer=<address>`), set by `zfs-ha-poolconf write ... --role primary --peer <nodeB-ip>` (and the mirror on the secondary), and
 enforced at boot by `zfs-ha-role`. Asymmetric fencing delays
 (`pcmk_delay_max`) make the primary the deterministic survivor of a
 simultaneous failure. Disable automatic failback: when the primary comes
@@ -193,8 +209,12 @@ pcs cluster config update transport link_mode=active
 zpool create -o multihost=on -o cachefile=/etc/zfs/zpool.cachefile.ha <POOL> \
     /dev/disk/by-id/wwn-0x... ...
 
-# 5. record the config + boot-time quiesce rule
-zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd>
+# 5. record the config + boot-time quiesce rule (run on the primary, then
+#    copy /etc/zfs-ha/pool.conf to the peer and set role/peer per host)
+zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd> \
+    --role primary --peer <nodeB-ip>          # on the primary
+zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd> \
+    --role secondary --peer <nodeA-ip>        # on the secondary
 zfs-ha-udevrule generate && udevadm control --reload
 
 # 6. NFS via sharenfs (the export travels with the pool)
@@ -246,7 +266,7 @@ in the HOWTO with cabling diagrams. The short version:
    drive's real serial and SAS address and run at full speed. Bad ones mask
    the serial, fabricate SAS addresses, and collapse from 150 MB/s to under
    2 MB/s under sustained load with constant reset storms. In my testing,
-   Emulex interposers worked; LSI ones did not. `docs/HOWTO.md` §12.3 has
+   Emulex interposers worked; LSI ones did not. `docs/HOWTO.md` §12.2 has
    the 30-second triage.
 3. **Plain SATA, single controller.** No interposers: one host cabled to one
    controller, the other controller unplugged, the `stp` strategy (if the

@@ -13,8 +13,8 @@
 #   2. Cut power to the owner node (PDU/BMC/power button).
 #   3. On the survivor:
 #        a. smp_rep_phy_sata --phy=<N> <bsg>   # expect nexus loss occurred: 1
-#        b. disk_handoff.sh release <disk>     # clear the stale affiliation
-#        c. disk_handoff.sh acquire <disk>     # verify + reset device
+#        b. zfs-ha-handoff release <disk>     # clear the stale affiliation
+#        c. zfs-ha-handoff acquire <disk>     # verify + reset device
 #        d. zpool import -f <POOL>
 #        e. mount and verify: write_client.py verify --path <mount>/test.dat
 #   4. Power the old owner back on; it must NOT import the pool on boot

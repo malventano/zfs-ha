@@ -133,6 +133,35 @@ def handoff_op(env, op, disk, extra=None):
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
+def host_reset_target():
+    """Resolve the SAS host adapter's sg node for sg_reset -H.
+
+    /dev/sg0 is frequently the SES enclosure device, not the HBA; resetting
+    the wrong generic device can wedge the enclosure session the SMP tools
+    depend on. Find the scsi_host that owns our SAS end devices and take
+    its first sg child.
+    """
+    import glob
+    # sg nodes map to scsi devices via /sys/class/scsi_device/<h:c:t:l>/device
+    for sg in sorted(glob.glob("/dev/sg*")):
+        base = os.path.basename(sg)
+        link = os.path.realpath(f"/sys/class/scsi_device/{base}" if False else
+                                f"/sys/class/scsi_generic/{base}/device")
+        if not os.path.isdir(link):
+            continue
+        # walk up to the scsi_host
+        host_dir = link
+        while host_dir and not os.path.basename(host_dir).startswith("host"):
+            host_dir = os.path.dirname(host_dir)
+        if not host_dir:
+            continue
+        host = os.path.basename(host_dir)
+        # only hosts that own SAS end devices (i.e. the HBA, not a USB/ATA bridge)
+        if glob.glob(f"/sys/class/sas_device/end_device-{host.split('host')[-1]}:*"):
+            return sg
+    return None
+
+
 ALLOW_FLAG = "/run/zfs-ha/allow-import"
 
 
@@ -149,9 +178,13 @@ def action_start(env):
     role_r = run([os.path.join(ha_bin, "zfs-ha-role")], timeout=300,
                  env={**os.environ, "ZFS_HA_CONF": env.get("config") or "/etc/zfs-ha/pool.conf"})
     if role_r.returncode == 1:
-        # secondary standing down - peer is handling it
-        ocf_exit(OCF_NOT_RUNNING,
-                 f"role arbitration: standing down (peer is primary)")
+        # secondary standing down - peer is handling it. OCF start must
+        # return an ERROR code (never a monitor/status code like
+        # OCF_NOT_RUNNING): pacemaker treats this as a failed start and
+        # leaves the resource stopped, which is the desired outcome.
+        ocf_exit(OCF_ERR_GENERIC,
+                 "role arbitration: standing down (peer is primary and "
+                 "serving the pool; not an error condition)")
     elif role_r.returncode != 0:
         ocf_exit(OCF_ERR_GENERIC,
                  f"role arbitration failed: {role_r.stderr.strip()}")
@@ -201,10 +234,18 @@ def action_start(env):
             # likely dropped them at boot (affiliation conflict) and a plain
             # scan cannot recover them. Force a host reset to recreate the
             # SCSI targets (MMP_ANALYSIS: sg_reset -H redoes full discovery).
-            print("attempting host reset to recover missing devices",
-                  file=sys.stderr)
-            run(["sg_reset", "-H", "/dev/sg0"], timeout=60)
-            time.sleep(20)  # mpt3sas port enable takes ~10s + udev settle
+            # Resolve the SAS host's sg node dynamically - /dev/sg0 is often
+            # the SES enclosure device, and resetting that would wedge the
+            # enclosure session the SMP tools depend on.
+            sas_host = host_reset_target()
+            if sas_host:
+                print(f"attempting host reset to recover missing devices "
+                      f"({sas_host})", file=sys.stderr)
+                run(["sg_reset", "-H", sas_host], timeout=60)
+                time.sleep(20)  # mpt3sas port enable takes ~10s + udev settle
+            else:
+                print("cannot determine SAS host node for host reset; "
+                      "skipping (devices may stay missing)", file=sys.stderr)
 
     present = [d for d in disks if d not in missing]
     if missing:

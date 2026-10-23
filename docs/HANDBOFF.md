@@ -33,7 +33,7 @@ DIRTY      anything else: suspended import, stuck export, D-state zpool,
 
 A host **checks in** via Pacemaker/Corosync after any reset: the cluster
 tells it whether it is SECONDARY (normal for the former primary after
-failover) or DIRTY (needs operator attention). `zfs-ha doctor` reports this.
+failover) or DIRTY (needs operator attention). `zfs-ha-doctor` reports this.
 
 ## The handoff (planned / clean move)
 

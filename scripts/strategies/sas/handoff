@@ -50,6 +50,7 @@ cmd_probe() {
 }
 
 cmd_release() {
+    local byid="$1"; shift
     # Release transport access AND our reservation (fencing=pr). Order:
     # export already happened at the RA layer; here we clear the PR so the
     # peer's preempt-or-acquire sees an unreserved disk, then quiesce.
@@ -89,17 +90,37 @@ cmd_acquire() {
     done
     if [ -n "$fence_evidence" ]; then
         echo "evidence=fence-verified $fence_evidence"
+        # Fenced takeover: the dead owner's registration may still hold the
+        # reservation. Preempt it so WE hold the reservation going forward.
+        if command -v zfs-ha-pr >/dev/null 2>&1; then
+            local victim
+            victim=$(zfs-ha-pr status "$byid" 2>/dev/null | grep -oE '0x[0-9a-f]+' | grep -v "$(zfs-ha-pr key)" | head -1)
+            if [ -n "$victim" ]; then
+                zfs-ha-pr preempt "$byid" "$victim" >/dev/null 2>&1 && \
+                    echo "preempted reservation from $victim"
+            fi
+        fi
         exit 0
     fi
-    # SCSI persistent reservation held by us? (fencing=pr - the SAS best
-    # practice path; zfs-ha-pr does the key management and parsing)
+    # SCSI persistent reservation path (fencing=pr - the SAS best practice):
+    # if we already hold it, done. Otherwise TAKE it (register + reserve).
+    # This is the fencing engaging, not just a check.
     if command -v zfs-ha-pr >/dev/null 2>&1; then
         if zfs-ha-pr held "$byid" 2>/dev/null; then
             echo "evidence=scsi-pr-held $byid"
             exit 0
         fi
-    elif command -v sg_persist >/dev/null 2>&1; then
-        # legacy path: crude registered-key check
+        # Not held: take the reservation. If a peer still holds it, this
+        # fails - which is correct: we must not take a disk the peer owns.
+        if zfs-ha-pr reserve "$byid" >/dev/null 2>&1; then
+            echo "evidence=scsi-pr-acquired $byid"
+            exit 0
+        fi
+        echo "acquire refused: reservation held by another key for $byid" >&2
+        exit 1
+    fi
+    # Legacy path without zfs-ha-pr: crude registered-key check
+    if command -v sg_persist >/dev/null 2>&1; then
         if sg_persist -r -d "$byid" 2>/dev/null | grep -qE "0x[0-9a-f]+ .*registered"; then
             echo "evidence=scsi-pr-held $byid"
             exit 0

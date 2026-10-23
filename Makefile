@@ -18,19 +18,25 @@ smp_send: scripts/smp_send.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 install: smp_send
-	install -m755 smp_send $(PREFIX)/bin/
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(HALIB) $(DESTDIR)$(OCFDIR)/zfsha
+	install -m755 smp_send $(DESTDIR)$(PREFIX)/bin/
 	install -m755 scripts/zfs-ha-handoff scripts/zfs-ha-config \
 	    scripts/zfs-ha-poolconf scripts/zfs-ha-quiesce scripts/zfs-ha-doctor \
 	    scripts/zfs-ha-mailbox scripts/zfs-ha-amialone scripts/zfs-ha-pr \
-	    scripts/zfs-ha-cutover $(HALIB)/
-	install -Dm755 scripts/strategies/stp/handoff $(HALIB)/strategies.d/stp/handoff
-	install -Dm755 scripts/strategies/sas/handoff $(HALIB)/strategies.d/sas/handoff
-	install -Dm755 scripts/strategies/null/handoff $(HALIB)/strategies.d/null/handoff
-	ln -sf $(HALIB)/zfs-ha-pr $(PREFIX)/bin/zfs-ha-pr
-	ln -sf $(HALIB)/zfs-ha-cutover $(PREFIX)/bin/zfs-ha-cutover
-	install -Dm755 scripts/zfsha-pool $(OCFDIR)/zfsha/Pool
-	install -m755 scripts/shelf-health.py $(PREFIX)/bin/shelf-health
-	@echo "installed: smp_send, handoff dispatcher + strategies, quiesce, doctor, mailbox, amialone, ocf:zfsha:Pool"
+	    scripts/zfs-ha-cutover scripts/zfs-ha-role scripts/zfs-ha-udevrule \
+	    scripts/zfs-ha-udev-delete $(DESTDIR)$(HALIB)/
+	install -Dm755 scripts/strategies/stp/handoff $(DESTDIR)$(HALIB)/strategies.d/stp/handoff
+	install -Dm755 scripts/strategies/sas/handoff $(DESTDIR)$(HALIB)/strategies.d/sas/handoff
+	install -Dm755 scripts/strategies/null/handoff $(DESTDIR)$(HALIB)/strategies.d/null/handoff
+	ln -sf $(HALIB)/zfs-ha-pr $(DESTDIR)$(PREFIX)/bin/zfs-ha-pr
+	ln -sf $(HALIB)/zfs-ha-cutover $(DESTDIR)$(PREFIX)/bin/zfs-ha-cutover
+	ln -sf $(HALIB)/zfs-ha-udevrule $(DESTDIR)$(PREFIX)/bin/zfs-ha-udevrule
+	install -m755 scripts/check_boot_import.sh $(DESTDIR)$(PREFIX)/bin/check_boot_import
+	install -m755 scripts/fence_zfs_ha_stp $(DESTDIR)$(HALIB)/fence_zfs_ha_stp
+	install -Dm755 scripts/zfsha-pool $(DESTDIR)$(OCFDIR)/zfsha/Pool
+	install -m755 utils/shelf-health.py $(DESTDIR)$(PREFIX)/bin/shelf-health
+	install -m755 utils/sas_topology.sh $(DESTDIR)$(PREFIX)/bin/sas_topology
+	@echo "installed: smp_send, handoff dispatcher + strategies, quiesce, doctor, role, mailbox, amialone, pr, cutover, udevrule + udev-delete, fence_zfs_ha_stp, check_boot_import, ocf:zfsha:Pool, shelf-health, sas_topology"
 
 check: smp_send
 	@echo "== topology check =="

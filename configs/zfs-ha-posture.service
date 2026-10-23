@@ -18,7 +18,7 @@
 # DefaultDependencies=no
 # After=systemd-udevd.service
 # Before=zfs-import-cache.service zfs-import-scan.service
-# ConditionPathExists=/etc/zfs/zfs-ha-pool
+# ConditionPathExists=/etc/zfs-ha/pool.conf
 #
 # [Service]
 # Type=oneshot

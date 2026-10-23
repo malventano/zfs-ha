@@ -18,9 +18,9 @@ disks_list() {
 
 cmd_get() {
     case "${1:-}" in
-        pool|strategy|fencing|mailbox|strict_acquire) get "$1" ;;
+        pool|strategy|fencing|mailbox|strict_acquire|role|peer) get "$1" ;;
         disks) disks_list ;;
-        *) echo "usage: $0 get {pool|disks|strategy|fencing|mailbox|strict_acquire}" >&2; exit 2 ;;
+        *) echo "usage: $0 get {pool|disks|strategy|fencing|mailbox|strict_acquire|role|peer}" >&2; exit 2 ;;
     esac
 }
 
