@@ -1,0 +1,135 @@
+#!/bin/sh
+# zfs-ha: boot-time role arbitration.
+#
+# Implements the designated primary/secondary boot algorithm:
+#
+#   PRIMARY host:
+#     - boots, waits for corosync/pacemaker, starts the pool immediately
+#     - if the cluster is down (peer not responding), starts the pool anyway
+#
+#   SECONDARY host:
+#     - boots, waits 3 minutes AFTER boot completes
+#     - checks: is the primary responding (corosync + pacemaker + pool)?
+#     - if primary is UP and has the pool: stand down (do nothing)
+#     - if primary is NOT responding after the full wait: take over
+#     - if the primary signals "stand down" (via a flag file on the shared
+#       state or via corosync), stand down immediately
+#
+# The role is configured in /etc/zfs-ha/pool.conf:
+#   role=primary    # or secondary
+#   peer=<peer-hostname-or-ip>
+#
+# Exit codes:
+#   0 = this host should start the pool (proceed)
+#   1 = this host should stand down (peer is handling it)
+#   2 = error / ambiguous
+set -u
+
+CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
+PEER_WAIT="${PEER_WAIT:-180}"          # seconds for secondary to wait after boot
+PEER_CHECK_INTERVAL="${PEER_CHECK_INTERVAL:-10}"
+COROSYNC_CHECK="${COROSYNC_CHECK:-5}"  # seconds to wait for corosync response
+
+log() { echo "$(date '+%H:%M:%S') zfs-ha-role: $*" >&2; }
+
+get_conf() {
+    grep -E "^$1=" "$CONF" 2>/dev/null | head -1 | cut -d= -f2-
+}
+
+ROLE=$(get_conf role)
+PEER=$(get_conf peer)
+POOL=$(get_conf pool)
+
+[ -n "$ROLE" ] || { log "ERROR: no role= in $CONF"; exit 2; }
+[ -n "$PEER" ] || { log "ERROR: no peer= in $CONF"; exit 2; }
+
+# --- peer liveness checks ---
+
+peer_corosync_up() {
+    # is the peer in the corosync membership?
+    corosync-cmapctl 2>/dev/null | grep -qE "members.*status.*joined" || return 1
+    # check the peer specifically by IP
+    corosync-cmapctl 2>/dev/null | grep -qE "$PEER" || return 1
+    return 0
+}
+
+peer_pacemaker_up() {
+    # can we reach the peer's pacemaker? (crm_mon from this node)
+    pcs status 2>/dev/null | grep -qE "Online.*$PEER" || return 1
+    return 0
+}
+
+peer_pool_up() {
+    # does the peer have the pool imported?
+    pcs status 2>/dev/null | grep -E "ha_pool.*Started.*$PEER" >/dev/null 2>&1
+    return $?
+}
+
+peer_ping() {
+    ping -c 1 -W 2 "$PEER" >/dev/null 2>&1
+}
+
+peer_all_up() {
+    peer_ping && peer_corosync_up && peer_pacemaker_up
+}
+
+# --- primary logic ---
+
+do_primary() {
+    log "role=primary: starting pool immediately"
+    # primary always proceeds - it owns the pool by default
+    # if the secondary also tried to start, MMP would suspend one of them
+    # and the cluster would resolve it
+    exit 0
+}
+
+# --- secondary logic ---
+
+do_secondary() {
+    log "role=secondary: waiting ${PEER_WAIT}s for primary to come up"
+
+    elapsed=0
+    while [ $elapsed -lt $PEER_WAIT ]; do
+        if peer_all_up; then
+            # primary is responding - check if it has the pool
+            if peer_pool_up; then
+                log "primary is up with the pool - standing down"
+                exit 1
+            fi
+            # primary is up but pool is not started yet - give it more time
+            log "primary is up but pool not started yet - waiting"
+        elif peer_ping; then
+            # peer is pingable but corosync/pacemaker not up yet
+            log "peer pingable but cluster services not up - waiting"
+        else
+            # peer is not responding at all
+            log "peer not responding (elapsed ${elapsed}s)"
+            # if the peer never comes up within the wait period, take over
+        fi
+        sleep $PEER_CHECK_INTERVAL
+        elapsed=$((elapsed + PEER_CHECK_INTERVAL))
+    done
+
+    # full wait elapsed - check one more time
+    if peer_all_up; then
+        if peer_pool_up; then
+            log "primary came up with the pool during wait - standing down"
+            exit 1
+        fi
+        # primary is up but pool not started - this is ambiguous
+        # the primary may be starting it right now; stand down and let
+        # pacemaker resolve
+        log "primary is up but pool state unclear - standing down"
+        exit 1
+    fi
+
+    # peer never came up - take over
+    log "peer did not come up after ${PEER_WAIT}s - taking over as primary"
+    exit 0
+}
+
+case "$ROLE" in
+    primary)   do_primary ;;
+    secondary) do_secondary ;;
+    *) log "ERROR: unknown role '$ROLE' (must be primary or secondary)"; exit 2 ;;
+esac

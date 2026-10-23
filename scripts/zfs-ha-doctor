@@ -1,0 +1,111 @@
+#!/bin/sh
+# zfs-ha: host health and dirty-state doctor.
+#
+#   zfs-ha-doctor [pool]
+#
+# Reports the host's storage posture per docs/HANDBOFF.md:
+#   CLEAN      no HA devices, no pool, no affiliations   (secondary, ready)
+#   PRIMARY    pool imported and healthy                 (active owner)
+#   SECONDARY  devices quiesced (deleted)                (standby, ready)
+#   DIRTY      anything else - needs operator action; most dirty states
+#              require a REBOOT to clean. Reporting "this host needs a
+#              reboot to be cleaned" is correct, expected behavior.
+set -u
+
+POOL="${1:-}"
+SMP="${SMP_PATH:-/usr/local/bin}"
+export PATH="$SMP:$PATH"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/lib}"
+
+issues=0
+state="CLEAN"
+
+note() { echo "  $*"; }
+warn() { echo "  WARN: $*"; issues=$((issues+1)); }
+crit() { echo "  CRIT: $*"; issues=$((issues+1)); }
+
+echo "== zfs-ha doctor =="
+
+# 1. imported pools
+imported=$(zpool list -H -o name 2>/dev/null | grep -v "^$" | tr '\n' ' ')
+if [ -n "$POOL" ] && echo "$imported" | grep -qw "$POOL"; then
+    health=$(zpool list -H -o health "$POOL" 2>/dev/null)
+    if [ "$health" = "ONLINE" ]; then
+        state="PRIMARY"
+        note "pool '$POOL' imported, ONLINE"
+    elif [ "$health" = "SUSPENDED" ]; then
+        state="DIRTY"
+        crit "pool '$POOL' SUSPENDED - MMP tripped. Cannot export or clear."
+        crit "REBOOT REQUIRED to clear the in-kernel suspended import."
+    else
+        state="DIRTY"
+        crit "pool '$POOL' imported but health=$health"
+    fi
+fi
+
+# 2. D-state zpool processes
+dz=$(ps -eo stat,comm | awk '$1 ~ /D/ && $2 ~ /zpool/ {print}' | wc -l)
+if [ "$dz" -gt 0 ]; then
+    state="DIRTY"
+    crit "$dz zpool process(es) in D-state (stuck I/O) - likely disks held by peer"
+    crit "delete the HA devices and wait for the peer to release, or reboot"
+fi
+
+# 3. device presence for the HA pool
+if [ -n "$POOL" ]; then
+    total=0; present=0
+    # D1 fix: disks from pool.conf (authoritative), not zpool status
+    for disk in $(grep -E '^disks=' /etc/zfs-ha/pool.conf 2>/dev/null | head -1 | cut -d= -f2- | tr ',' ' '); do
+        total=$((total+1))
+        [ -e "$(readlink -f "$disk" 2>/dev/null)" ] && present=$((present+1))
+    done
+    if [ "$total" -gt 0 ]; then
+        note "HA devices present: $present/$total"
+        if [ "$present" -gt 0 ] && ! echo "$imported" | grep -qw "$POOL"; then
+            state="DIRTY"
+            warn "HA devices present but pool not imported - stale posture"
+            warn "run: zfs-ha-quiesce delete $POOL  (or import the pool)"
+        fi
+    fi
+fi
+
+# 4. affiliations held with no imported pool (stale)
+if command -v smp_rep_phy_sata >/dev/null 2>&1; then
+    held=0
+    for e in /dev/bsg/expander-*; do
+        [ -e "$e" ] || continue
+        for phy in $(seq 0 15); do
+            v=$(smp_rep_phy_sata --phy="$phy" "$e" 2>/dev/null | grep "affiliation valid" | awk '{print $3}')
+            [ "$v" = "1" ] && held=$((held+1))
+        done
+    done
+    if [ "$held" -gt 0 ] && ! echo "$imported" | grep -qw "${POOL:-x}"; then
+        state="DIRTY"
+        warn "$held disk affiliation(s) held but no HA pool imported"
+        warn "stale affiliations - release with op=6 (self) or op=2 (peer dead)"
+    fi
+    note "affiliations held: $held"
+fi
+
+# 5. boot-time discovery conflicts
+conf=$(dmesg 2>/dev/null | grep -c "sata affiliation conflict")
+if [ "$conf" -gt 0 ]; then
+    warn "$conf disk(s) dropped at boot due to affiliation conflict"
+    warn "recovery when promoted: op=2 hard reset + sg_reset -H (host reset)"
+fi
+
+# 6. cluster membership
+if command -v pcs >/dev/null 2>&1; then
+    if pcs status >/dev/null 2>&1; then
+        note "cluster: member, quorate"
+    else
+        warn "cluster: not connected (pacemaker/corosync down?)"
+    fi
+fi
+
+echo "== posture: $state =="
+if [ "$state" = "DIRTY" ]; then
+    echo "this host is DIRTY and must be cleaned before it may own the pool."
+    echo "most dirty states require a REBOOT - that is expected behavior."
+fi
+exit $([ "$state" = "DIRTY" ] && echo 1 || echo 0)

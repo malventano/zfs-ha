@@ -1,0 +1,73 @@
+#!/bin/sh
+# zfs-ha: read pool.conf (the authoritative pool + disk list).
+# Sourced by other tools; also usable standalone:
+#   zfs-ha-config get pool|disks|strategy|fencing|mailbox|strict_acquire
+#   zfs-ha-config check          # validate the config (preflight)
+set -u
+
+CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
+
+get() {
+    [ -f "$CONF" ] || { echo "ERROR: $CONF missing (run zfs-ha-poolconf write)" >&2; return 1; }
+    grep -E "^$1=" "$CONF" | head -1 | cut -d= -f2-
+}
+
+disks_list() {
+    get disks | tr ',' ' '
+}
+
+cmd_get() {
+    case "${1:-}" in
+        pool|strategy|fencing|mailbox|strict_acquire) get "$1" ;;
+        disks) disks_list ;;
+        *) echo "usage: $0 get {pool|disks|strategy|fencing|mailbox|strict_acquire}" >&2; exit 2 ;;
+    esac
+}
+
+cmd_check() {
+    local rc=0
+    [ -f "$CONF" ] || { echo "FAIL: $CONF missing"; return 1; }
+    for key in pool disks strategy fencing; do
+        v=$(get "$key") || rc=1
+        [ -n "$v" ] || { echo "FAIL: '$key' missing/empty in $CONF"; rc=1; }
+    done
+    # by-id invariant
+    for d in $(disks_list); do
+        case "$d" in
+            /dev/disk/by-id/*) ;;
+            *) echo "FAIL: non-by-id disk path: $d"; rc=1 ;;
+        esac
+    done
+    # strategy/fencing preflight (D7: auto+none and bogus values also fail)
+    s=$(get strategy); f=$(get fencing)
+    case "$s" in
+        stp|sas|null|auto) ;;
+        *) echo "FAIL: unknown strategy '$s'"; rc=1 ;;
+    esac
+    case "$f" in
+        none|bmc|pdu|pikvm|sbd|pr) ;;
+        *) echo "FAIL: unknown fencing '$f'"; rc=1 ;;
+    esac
+    case "$s" in
+        sas|null|auto)
+            case "$f" in
+                none) echo "FAIL: strategy=$s with fencing=none is unsafe (preflight)"; rc=1 ;;
+            esac
+            ;;
+    esac
+    # mailbox must not be a pool member
+    mb=$(get mailbox)
+    if [ -n "$mb" ]; then
+        for d in $(disks_list); do
+            [ "$mb" = "$d" ] && { echo "FAIL: mailbox is a pool member"; rc=1; }
+        done
+    fi
+    [ "$rc" = "0" ] && echo "OK: $CONF valid (pool=$(get pool), strategy=$s, fencing=$f, $(disks_list | wc -w) disks)"
+    return $rc
+}
+
+case "${1:-}" in
+    get)   shift; cmd_get "$@" ;;
+    check) cmd_check ;;
+    *) echo "usage: $0 {get <key>|check}" >&2; exit 2 ;;
+esac

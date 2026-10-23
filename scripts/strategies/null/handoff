@@ -1,0 +1,109 @@
+#!/bin/sh
+# zfs-ha strategy: null - shelf does not enforce single-initiator (plain JBOD,
+# or SAS disks with no affiliation enforcement and no fencing configured).
+#
+# WARNING: with strategy=null, NOTHING prevents both hosts from doing I/O to
+# the same disk simultaneously except multihost=on MMP (a detection backstop,
+# not prevention). The preflight (zfs-ha-poolconf / zfs-ha-config) refuses
+# strategy=null with fencing=none for this reason.
+#
+# This strategy exists for shelves that genuinely cannot enforce exclusivity
+# and where the user accepts MMP-only protection with fencing configured.
+set -u
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+cmd_probe() {
+    echo "protocol=unknown"
+    echo "affiliation_enforced=no"
+    echo "multipath=no"
+    echo "shared_block_capable=no"
+}
+
+cmd_release() {
+    # nothing to release at the transport; quiesce the OS view
+    cmd_quiesce "$@"
+}
+
+cmd_recover() {
+    local byid="$1"; shift
+    local fence_evidence=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fence-evidence) fence_evidence="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$fence_evidence" ] || { die "refused: recover requires --fence-evidence" && exit 1; }
+    cmd_rescan "$byid"
+}
+
+cmd_acquire() {
+    local byid="$1"; shift
+    local fence_evidence=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fence-evidence) fence_evidence="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$fence_evidence" ] || {
+        echo "acquire refused: strategy=null requires fencing evidence" >&2
+        exit 1
+    }
+    echo "evidence=fence-verified $fence_evidence"
+}
+
+cmd_quiesce() {
+    local byid="$1"
+    local sd
+    sd=$(basename "$(readlink -f "$byid" 2>/dev/null)")
+    [ -n "$sd" ] || { echo "quiesce: cannot resolve" >&2; exit 1; }
+    if [ -e "/sys/block/$sd/device/delete" ]; then
+        echo 1 > "/sys/block/$sd/device/delete" || { echo "quiesce: delete failed" >&2; exit 1; }
+        echo "quiesced: $byid ($sd)"
+    else
+        echo "quiesced (already absent): $byid"
+    fi
+}
+
+cmd_rescan() {
+    local byid="$1"
+    local host="" h
+    for h in /sys/class/sas_host/*; do
+        host=$(basename "$h")
+        [ -e "/dev/bsg/expander-${host#host}:"* ] && break
+        host=""
+    done
+    [ -n "$host" ] && echo "- - -" > "/sys/class/scsi_host/$host/scan" 2>/dev/null
+    udevadm settle --timeout=30 2>/dev/null
+    if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
+        echo "rescanned: $byid present"
+        exit 0
+    fi
+    echo "rescan: $byid did not reappear" >&2
+    exit 1
+}
+
+cmd_verify() {
+    local byid="$1"
+    if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
+        echo "verify: $byid present"
+        exit 0
+    fi
+    echo "verify: $byid absent"
+    exit 1
+}
+
+[ $# -ge 1 ] || { echo "usage: $0 <op> <by-id> [args]" >&2; exit 2; }
+OP="$1"; shift
+case "$OP" in
+    probe)   cmd_probe "$@" ;;
+    release) cmd_release "$@" ;;
+    recover) cmd_recover "$@" ;;
+    acquire) cmd_acquire "$@" ;;
+    quiesce) cmd_quiesce "$@" ;;
+    rescan)  cmd_rescan "$@" ;;
+    verify)  cmd_verify "$@" ;;
+    *) echo "unknown op: $OP" >&2; exit 2 ;;
+esac

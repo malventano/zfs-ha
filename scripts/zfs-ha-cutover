@@ -1,0 +1,192 @@
+#!/bin/sh
+# zfs-ha: controlled SATA cutover (no interposers, no transport affiliation).
+#
+# THE PROBLEM (user direction 2026-10-17): plain SATA disks (or SATA behind
+# dumb interposers) have NO transport-level exclusivity. Both hosts can
+# always issue I/O. There is no affiliation to release - only the OS device
+# view. A naive failover (peer scans while we still hold the disk) risks
+# both hosts importing the same pool: silent corruption.
+#
+# THE ANSWER: a CONTROLLED CUTOVER PROTOCOL. When both hosts are healthy
+# (planned maintenance), the current owner proactively releases everything
+# in a strict order with settle delays, then the peer acquires. The peer
+# NEVER proceeds until it has positive evidence the owner released.
+#
+# This is the "special case when both hosts are working" path. Emergency
+# failover (owner dead) is NOT this script - that is the fencing path
+# (fence first, then preempt). This script refuses to run if the peer is
+# not provably alive and idle.
+#
+# Sequence (owner side, --release):
+#   1. preflight: peer alive (ping + ssh), pool healthy, we hold it
+#   2. zfs unmount -a + stop nfs (release data path)
+#   3. zpool export (writes clean labels, releases MMP)
+#   4. quiesce: delete each disk device from OUR OS (delay per disk)
+#   5. write "released" intent marker to mailbox (if configured)
+#   6. final settle
+#
+# Sequence (peer side, --acquire):
+#   1. preflight: peer alive, owner's mailbox slot says RELEASED (if mailbox)
+#   2. rescan each disk by-id (delay per disk, retry)
+#   3. verify ALL disks present (never import partial for planned cutover)
+#   4. import pool
+#   5. mount + start nfs
+#
+# Usage:
+#   zfs-ha-cutover release            # on the current owner
+#   zfs-ha-cutover acquire            # on the peer taking over
+#   zfs-ha-cutover status             # what does this host think is going on
+# Env:
+#   ZFS_HA_CONF     pool.conf path (default /etc/zfs-ha/pool.conf)
+#   ZFS_HA_PEER     peer host (default from pool.conf peer=)
+#   ZFS_HA_SETTLE   per-disk settle seconds (default 2)
+#   ZFS_HA_QUIESCE  1 = delete devices after export (default 1)
+set -u
+
+CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
+SETTLE="${ZFS_HA_SETTLE:-2}"
+QUIESCE="${ZFS_HA_QUIESCE:-1}"
+RUN=/run/zfs-ha
+PEER_USER="${ZFS_HA_PEER_USER:-w}"
+SSH_OPTS="-o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+log() { echo "[cutover] $*"; }
+
+conf_get() { grep -E "^$1=" "$CONF" 2>/dev/null | head -1 | cut -d= -f2-; }
+
+POOL=$(conf_get pool)
+PEER="${ZFS_HA_PEER:-$(conf_get peer)}"
+DISKS=$(conf_get disks | tr ',' ' ')
+[ -n "$POOL" ] || die "no pool in $CONF"
+[ -n "$PEER" ] || die "no peer in $CONF (set peer= or ZFS_HA_PEER)"
+[ -n "$DISKS" ] || die "no disks in $CONF"
+
+peer_alive() {
+    ping -c1 -W2 "$PEER" >/dev/null 2>&1 || return 1
+    # ssh check: the peer must be reachable AND its cluster services must be
+    # down or idle - a peer running its own import is a hard stop.
+    ssh $SSH_OPTS "${PEER_USER}@${PEER}" true >/dev/null 2>&1
+}
+
+peer_pool_state() {
+    # what does the peer think about our pool? (empty = not imported)
+    ssh $SSH_OPTS "${PEER_USER}@${PEER}" \
+        "zpool list -H -o name,health $POOL 2>/dev/null" 2>/dev/null
+}
+
+wait_peer_idle() {
+    local tries=0
+    while [ $tries -lt 30 ]; do
+        [ -z "$(peer_pool_state)" ] && return 0
+        tries=$((tries + 1))
+        sleep 2
+    done
+    return 1
+}
+
+cmd_status() {
+    echo "pool:      $POOL"
+    echo "peer:      $PEER ($(peer_alive && echo reachable || echo UNREACHABLE))"
+    echo "peer pool: $(peer_pool_state || echo not-imported)"
+    echo "our pool:  $(zpool list -H -o name,health "$POOL" 2>/dev/null || echo not-imported)"
+    local present=0
+    for d in $DISKS; do
+        [ -e "$(readlink -f "$d" 2>/dev/null)" ] && present=$((present + 1))
+    done
+    echo "disks:     $present/$(echo $DISKS | wc -w) present in OS"
+}
+
+cmd_release() {
+    log "=== controlled cutover: RELEASE on $(hostname) ==="
+    zpool list -H -o name "$POOL" >/dev/null 2>&1 || die "pool $POOL not imported here"
+    peer_alive || die "peer $PEER unreachable - refusing (this is a CONTROLLED cutover)"
+    # peer must not already have the pool
+    [ -z "$(peer_pool_state)" ] || die "peer already has $POOL imported - aborting"
+
+    # 1. data path down first
+    log "unmounting datasets"
+    zfs unmount -a >/dev/null 2>&1
+    systemctl stop nfs-server >/dev/null 2>&1
+
+    # 2. export (clean labels + MMP release)
+    log "exporting $POOL"
+    zpool export "$POOL" || die "export failed - pool still mounted/active?"
+
+    # 3. quiesce: remove devices from OUR OS so nothing touches them.
+    #    Per-disk settle: the SCSI delete is async; deleting all at once can
+    #    leave the mpt3sas mid-teardown when the peer scans, and the peer's
+    #    scan can then re-attach the device HERE (observed on DS460C).
+    if [ "$QUIESCE" = "1" ]; then
+        for d in $DISKS; do
+            local sd
+            sd=$(basename "$(readlink -f "$d" 2>/dev/null)")
+            if [ -n "$sd" ] && [ -e "/sys/block/$sd/device/delete" ]; then
+                log "quiesce $sd"
+                echo 1 > "/sys/block/$sd/device/delete"
+                sleep "$SETTLE"
+            fi
+        done
+    fi
+
+    # 4. intent marker for the peer (best-effort, never sole dependency)
+    mkdir -p "$RUN"
+    date -u '+%s %H released' > "$RUN/cutover.state" 2>/dev/null
+
+    log "final settle"
+    sleep "$SETTLE"
+    udevadm settle --timeout=10 2>/dev/null
+    log "RELEASE complete - peer may acquire"
+}
+
+cmd_acquire() {
+    log "=== controlled cutover: ACQUIRE on $(hostname) ==="
+    peer_alive || die "peer $PEER unreachable - refusing"
+    zpool list -H -o name "$POOL" >/dev/null 2>&1 && die "$POOL already imported here"
+    # peer must have released: not imported there AND (best effort) marker
+    [ -z "$(peer_pool_state)" ] || die "peer still has $POOL imported - not released"
+    if ssh $SSH_OPTS "${PEER_USER}@${PEER}" \
+        "cat /run/zfs-ha/cutover.state 2>/dev/null" 2>/dev/null | grep -q released; then
+        log "peer marker: RELEASED confirmed"
+    else
+        log "WARNING: no release marker from peer (continuing on peer-pool-empty evidence)"
+    fi
+
+    # 1. rescan each disk with settle + retry. SATA devices re-appear on the
+    #    scsi host that owns their path; a full host scan is the reliable way.
+    local missing=""
+    for attempt in 1 2 3; do
+        missing=""
+        for d in $DISKS; do
+            [ -e "$(readlink -f "$d" 2>/dev/null)" ] && continue
+            log "rescan attempt $attempt: $d"
+            for h in /sys/class/scsi_host/host*; do
+                echo "- - -" > "$h/scan" 2>/dev/null
+            done
+            sleep "$SETTLE"
+            [ -e "$(readlink -f "$d" 2>/dev/null)" ] || missing="$missing $d"
+        done
+        [ -z "$missing" ] && break
+        sleep "$((SETTLE * 2))"
+    done
+    [ -z "$missing" ] || die "disks never reappeared:$missing - NOT importing (planned cutover requires all disks)"
+
+    # 2. all present: import
+    log "importing $POOL"
+    zpool import "$POOL" || die "import failed"
+    zpool status "$POOL" | head -8
+
+    # 3. data path up
+    systemctl start nfs-server >/dev/null 2>&1
+    zfs mount -a >/dev/null 2>&1
+    mkdir -p "$RUN"
+    date -u '+%s %H acquired' > "$RUN/cutover.state" 2>/dev/null
+    log "ACQUIRE complete"
+}
+
+case "${1:-}" in
+    release) cmd_release ;;
+    acquire) cmd_acquire ;;
+    status)  cmd_status ;;
+    *) echo "usage: zfs-ha-cutover {release|acquire|status}" >&2; exit 2 ;;
+esac

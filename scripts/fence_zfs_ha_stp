@@ -1,0 +1,225 @@
+#!/bin/sh
+# zfs-ha: fence agent - SAS/STP storage isolation via SMP PHY CONTROL.
+#
+# A stonith fence agent that isolates the peer at the shelf level: hard-resets
+# all pool disk phys and clears affiliations held by the peer's SAS address.
+# After fencing, the peer cannot do I/O to the pool disks (its affiliations
+# are gone and new ones are refused while our phys hold the disks).
+#
+# This is NOT a power fence - the peer OS keeps running. It IS a storage
+# fence: the peer loses all access to the shared disks. Combined with MMP
+# (multihost=on) and the VIP teardown ordering, this provides a defensible
+# fencing story for SATA/STP shelves where BMC/PDU fencing is unavailable.
+#
+# Usage (stonith agent interface):
+#   fence_zfs_ha_stp -o status  --peer-sas <addr> --expander <bsg>
+#   fence_zfs_ha_stp -o off     --peer-sas <addr> --expander <bsg>
+#   fence_zfs_ha_stp -o on      --peer-sas <addr> --expander <bsg>   (unfence)
+#   fence_zfs_ha_stp -o monitor --peer-sas <addr> --expander <bsg>
+#   fence_zfs_ha_stp -o metadata
+#
+# Also accepts pcmk_host_list, pcmk_host_map for pacemaker integration.
+set -u
+
+SMP_BIN="${SMP_PATH:-/usr/local/bin}"
+export PATH="$SMP_BIN:$PATH"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/lib}"
+
+PEER_SAS=""
+EXPANDER=""
+ACTION=""
+
+usage() {
+    echo "usage: $0 -o {status|off|on|monitor|metadata} --peer-sas <addr> [--expander <bsg>]" >&2
+    echo "       --expander is optional; expanders are auto-discovered if omitted" >&2
+    exit 2
+}
+
+# Dynamic expander discovery: expander numbering changes across reboots.
+# Scan /dev/bsg/expander-* and return those with attached disk phys.
+discover_expanders() {
+    local exps=""
+    for e in /dev/bsg/expander-*; do
+        [ -e "$e" ] || continue
+        exps="$exps $e"
+    done
+    echo "$exps"
+}
+
+# Find expander(s) that have the peer's affiliations
+find_target_expanders() {
+    local peer="$1"
+    local targets=""
+    for e in $(discover_expanders); do
+        local phys
+        phys=$(smp_discover "$e" 2>/dev/null | grep "D:attached" | awk '{print $2}' | tr -d ':' | sed 's/D$//')
+        for phy in $phys; do
+            local addr
+            addr=$(smp_rep_phy_sata --phy="$phy" "$e" 2>/dev/null | grep "affiliated STP initiator" | awk '{print $NF}')
+            if [ "$addr" = "$peer" ]; then
+                targets="$targets $e"
+                break
+            fi
+        done
+    done
+    echo "$targets"
+}
+
+# Parse command-line args
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|--action) ACTION="$2"; shift 2 ;;
+        --peer-sas) PEER_SAS="$2"; shift 2 ;;
+        --expander) EXPANDER="$2"; shift 2 ;;
+        pcmk_host_list|pcmk_host_map|--pcmk_host_list|--pcmk_host_map)
+            shift 2 ;;
+        -h|--help) usage ;;
+        *) shift ;;
+    esac
+done
+
+# If no action from CLI, read stdin (stonith_admin passes key=value pairs)
+if [ -z "$ACTION" ]; then
+    while IFS= read -r line; do
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "$key" in
+            action) ACTION="$val" ;;
+            peer_sas) PEER_SAS="$val" ;;
+            expander) EXPANDER="$val" ;;
+        esac
+    done
+fi
+
+[ -n "$ACTION" ] || usage
+
+if [ "$ACTION" = "metadata" ]; then
+cat <<META
+<?xml version="1.0"?>
+<resource-agent name="fence_zfs_ha_stp" shortdesc="SAS/STP storage isolation fence">
+<longdesc>
+Fences the peer by hard-resetting all pool disk phys and clearing STP
+affiliations held by the peer's SAS address. The peer loses all access to
+the shared pool disks. This is a storage fence, not a power fence - the
+peer OS keeps running but cannot do I/O to the pool. Use with MMP
+(multihost=on) as a split-brain backstop.
+</longdesc>
+<parameters>
+<parameter name="peer_sas">
+  <getopt mixed="--peer-sas=ADDR" />
+  <content type="string" />
+  <shortdesc lang="en">Peer's HBA SAS address</shortdesc>
+</parameter>
+<parameter name="expander">
+  <getopt mixed="--expander=BSG (optional)" />
+  <content type="string" />
+  <shortdesc lang="en">Expander bsg device (e.g. /dev/bsg/expander-0:1)</shortdesc>
+</parameter>
+</parameters>
+<actions>
+  <action name="status" />
+  <action name="off" />
+  <action name="on" />
+  <action name="monitor" />
+  <action name="metadata" />
+</actions>
+</resource-agent>
+META
+    exit 0
+fi
+
+[ -n "$PEER_SAS" ] || { echo "ERROR: --peer-sas required" >&2; exit 2; }
+
+# Resolve expanders: use --expander if given and valid, otherwise auto-discover
+if [ -n "$EXPANDER" ] && [ -e "$EXPANDER" ]; then
+    TARGET_EXPS="$EXPANDER"
+else
+    TARGET_EXPS=$(find_target_expanders "$PEER_SAS")
+    if [ -z "$TARGET_EXPS" ]; then
+        TARGET_EXPS=$(discover_expanders)
+    fi
+    if [ -z "$TARGET_EXPS" ]; then
+        echo "ERROR: no expanders found" >&2
+        exit 2
+    fi
+fi
+
+# count affiliations held by peer across all target expanders
+count_peer_held() {
+    local held=0
+    for exp in $TARGET_EXPS; do
+        local phys
+        phys=$(smp_discover "$exp" 2>/dev/null | grep "D:attached" | awk '{print $2}' | tr -d ':' | sed 's/D$//')
+        for phy in $phys; do
+            local addr
+            addr=$(smp_rep_phy_sata --phy="$phy" "$exp" 2>/dev/null | grep "affiliated STP initiator" | awk '{print $NF}')
+            [ "$addr" = "$PEER_SAS" ] && held=$((held+1))
+        done
+    done
+    echo $held
+}
+
+cmd_status() {
+    local held
+    held=$(count_peer_held)
+    if [ "$held" -gt 0 ]; then
+        echo "peer holds $held affiliation(s) - NOT fenced"
+        exit 1
+    fi
+    echo "peer holds no affiliations - fenced (or idle)"
+    exit 0
+}
+
+cmd_off() {
+    local cleared=0 reset=0
+    for exp in $TARGET_EXPS; do
+        local phys
+        phys=$(smp_discover "$exp" 2>/dev/null | grep "D:attached" | awk '{print $2}' | tr -d ':' | sed 's/D$//')
+        for phy in $phys; do
+            smp_phy_control --phy="$phy" --op=2 "$exp" >/dev/null 2>&1
+            reset=$((reset+1))
+        done
+    done
+    sleep 10
+    for exp in $TARGET_EXPS; do
+        local phys
+        phys=$(smp_discover "$exp" 2>/dev/null | grep "D:attached" | awk '{print $2}' | tr -d ':' | sed 's/D$//')
+        for phy in $phys; do
+            local addr
+            addr=$(smp_rep_phy_sata --phy="$phy" "$exp" 2>/dev/null | grep "affiliated STP initiator" | awk '{print $NF}')
+            if [ "$addr" = "$PEER_SAS" ]; then
+                smp_phy_control --phy="$phy" --op=ca "$exp" >/dev/null 2>&1
+                cleared=$((cleared+1))
+            fi
+        done
+    done
+    sleep 3
+    local still
+    still=$(count_peer_held)
+    if [ "$still" -gt 0 ]; then
+        echo "FENCE FAILED: peer still holds $still affiliation(s)" >&2
+        exit 1
+    fi
+    echo "fenced: $reset phys reset, $cleared affiliations cleared, 0 remaining"
+    exit 0
+}
+
+cmd_on() {
+    # unfence: nothing to do - affiliations clear naturally when the peer
+    # is released. The peer can re-affiliate on its next I/O after unfencing.
+    echo "unfenced: peer may re-affiliate on next I/O"
+    exit 0
+}
+
+cmd_monitor() {
+    # same as status but for pacemaker monitor (0 = healthy)
+    cmd_status
+}
+
+case "$ACTION" in
+    status)  cmd_status ;;
+    off)     cmd_off ;;
+    on)      cmd_on ;;
+    monitor) cmd_monitor ;;
+    *)       usage ;;
+esac

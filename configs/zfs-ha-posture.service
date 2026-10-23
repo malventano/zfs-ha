@@ -1,0 +1,36 @@
+#!/bin/sh
+# zfs-ha: boot-time posture unit (install as /etc/systemd/system/zfs-ha-posture.service)
+#
+# Runs BEFORE udev settles and before zfs-import services. Deletes all HA-pool
+# devices so a booting secondary cannot probe them. This implements the
+# "boot-time bringup" rule in docs/HANDBOFF.md:
+#
+#   A host that had been primary and is rebooting comes back as SECONDARY:
+#   it checks in via pacemaker/corosync, learns its role from the cluster,
+#   and keeps its devices deleted unless promoted.
+#
+# A primary that crashed comes back DIRTY (its devices reappear at boot and
+# the pool is not imported); the doctor flags it and the operator reboots or
+# cleans it. It never auto-imports.
+#
+# [Unit]
+# Description=ZFS-HA boot posture: quiesce HA pool devices
+# DefaultDependencies=no
+# After=systemd-udevd.service
+# Before=zfs-import-cache.service zfs-import-scan.service
+# ConditionPathExists=/etc/zfs/zfs-ha-pool
+#
+# [Service]
+# Type=oneshot
+# ExecStart=/usr/lib/zfs-ha/zfs-ha-quiesce delete
+# RemainAfterExit=yes
+#
+# [Install]
+# WantedBy=sysinit.target
+#
+# The pool name and disk list come from /etc/zfs-ha/pool.conf (read directly
+# by zfs-ha-quiesce - no shell substitution in the unit, which systemd does
+# not support). Note: ordering After=systemd-udevd.service (correct name) and
+# Before=zfs-import-* still races udev coldplug; for full robustness add a
+# udev rule that ignores the HA WWNs until the posture unit runs.
+# Enable with: systemctl enable zfs-ha-posture.service

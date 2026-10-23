@@ -1,0 +1,269 @@
+#!/bin/sh
+# zfs-ha strategy: stp - SATA disks behind a SAS expander (STP affiliation).
+#
+# This is the validated reference strategy. SATA STP affiliation is
+# hardware-enforced single-initiator per disk; handoff requires SMP PHY
+# CONTROL operations through the expander.
+#
+# Contract (docs/REVIEW_MODULARITY.md 3.3): all ops take a by-id path and
+# fail closed. Exit codes: 0 ok, 1 refused, 2 usage, 3 transient, 4 unsupported.
+set -u
+
+SMP_BIN="${SMP_PATH:-/usr/local/bin}"
+export PATH="$SMP_BIN:$PATH"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/lib}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# resolve by-id -> sd node -> (bsg, phy). Must be called BEFORE any delete.
+resolve_phy() {
+    local byid="$1"
+    local sd
+    sd=$(basename "$(readlink -f "$byid" 2>/dev/null)")
+    [ -n "$sd" ] && [ "$sd" != "$byid" ] || die "cannot resolve $byid"
+    local sysdev="/sys/block/$sd/device"
+    [ -e "$sysdev" ] || die "$byid ($sd): no sysfs entry"
+    local enddev
+    enddev=$(readlink -f "$sysdev" | grep -o 'end_device-[0-9]*:[0-9]*:[0-9]*' | head -1)
+    [ -n "$enddev" ] || die "$byid: not SAS-attached"
+    local hostnum exp phy
+    hostnum=$(echo "$enddev" | cut -d: -f1 | sed 's/end_device-//')
+    exp=$(echo "$enddev" | cut -d: -f2)
+    # SMP phy id = phy_identifier attribute (NOT the end_device name index -
+    # sysfs numbering is arbitrary after rescans; VALIDATED finding)
+    phy=$(cat "/sys/class/sas_device/$enddev/phy_identifier" 2>/dev/null)
+    [ -n "$phy" ] || die "$byid: no phy_identifier"
+    local bsg="/dev/bsg/expander-${hostnum}:${exp}"
+    [ -e "$bsg" ] || die "$byid: no bsg node $bsg"
+    echo "$bsg $phy $sd"
+}
+
+aff_state() {
+    local bsg="$1" phy="$2" out="" i
+    # retry: the expander can transiently fail REPORT PHY SATA under load
+    for i in 1 2 3; do
+        out=$(smp_rep_phy_sata --phy="$phy" "$bsg" 2>/dev/null \
+            | grep -E "affiliation valid|affiliated STP initiator" \
+            | awk '{print $NF}' | paste -sd' ')
+        [ -n "$out" ] && { echo "$out"; return 0; }
+        sleep 1
+    done
+    echo ""
+}
+
+cmd_probe() {
+    local byid="$1"
+    local out
+    out=$(resolve_phy "$byid" 2>/dev/null) || {
+        echo "protocol=unknown"
+        echo "affiliation_enforced=unknown"
+        exit 0
+    }
+    set -- $out
+    local bsg="$1" phy="$2"
+    local stp
+    stp=$(smp_rep_phy_sata --phy="$phy" "$bsg" 2>/dev/null | grep -c "affiliations supported")
+    echo "protocol=sata"
+    if [ "${stp:-0}" -gt 0 ]; then
+        echo "affiliation_enforced=yes"
+    else
+        echo "affiliation_enforced=no"
+    fi
+    echo "multipath=no"
+    echo "shared_block_capable=no"
+}
+
+# Resolve phy for a device that may or may not be in the OS.
+# If present: sysfs. If deleted: look up the cached mapping (written by quiesce)
+# or find the disk on the expander by matching its WWN against DISCOVER output.
+resolve_phy_any() {
+    local byid="$1"
+    local sd
+    sd=$(basename "$(readlink -f "$byid" 2>/dev/null)")
+    if [ -n "$sd" ] && [ -e "/sys/block/$sd/device" ]; then
+        resolve_phy "$byid" && return 0
+    fi
+    # device deleted: try cached mapping (keyed by wwn)
+    local wwn
+    wwn=$(basename "$byid" | sed 's/^wwn-0x//')
+    local cache="/run/zfs-ha/phymap"
+    if [ -f "$cache" ]; then
+        local line
+        line=$(grep "^$wwn " "$cache" 2>/dev/null | head -1)
+        if [ -n "$line" ]; then
+            echo "$line" | cut -d' ' -f2-
+            return 0
+        fi
+    fi
+    # last resort: scan expanders via DISCOVER for the disk's SAS address
+    local e p addr
+    for e in /dev/bsg/expander-*; do
+        [ -e "$e" ] || continue
+        addr=$(smp_discover "$e" 2>/dev/null | grep -i "$wwn" | head -1)
+        [ -n "$addr" ] || continue
+        # discover output lines contain the disk sas addr; phy id is the first field
+        p=$(echo "$addr" | awk '{print $2}' | tr -d ':')
+        # fall back: REPORT GENERAL on each phy is too slow; use smp_discover_list
+        # not implemented - require cache
+        break
+    done
+    die "cannot resolve phy for $byid (device absent, no cached mapping)"
+}
+
+cmd_release() {
+    local byid="$1"
+    local out
+    out=$(resolve_phy_any "$byid") || exit 1
+    set -- $out
+    local bsg="$1" phy="$2" sd="$3"
+    # If the device is still in the OS, quiesce it first (release-while-present
+    # re-affiliates immediately - VALIDATION V10.1). This makes release
+    # self-sufficient: quiesce+release in one op.
+    if [ -n "$sd" ] && [ -e "/sys/block/$sd/device/delete" ]; then
+        echo 1 > "/sys/block/$sd/device/delete" 2>/dev/null
+        sleep 1
+    fi
+    smp_phy_control --phy="$phy" --op=ca "$bsg" >/dev/null 2>&1
+    local rc=$?
+    [ $rc -eq 0 ] || { echo "release: SMP op failed rc=$rc" >&2; exit 1; }
+    sleep 1
+    local state
+    state=$(aff_state "$bsg" "$phy")
+    # clean = affiliation valid "0" (any trailing addr is 0x0 or empty)
+    case "$state" in
+        "0 "*|"0") echo "released: $byid" ;;
+        "") echo "release: cannot read post-state" >&2; exit 1 ;;
+        *) echo "release: post-state '$state' not clean" >&2; exit 1 ;;
+    esac
+}
+
+cmd_recover() {
+    local byid="$1"; shift
+    local fence_evidence=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fence-evidence) fence_evidence="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    # SAFETY: aggressive recovery (hard reset) requires fencing evidence.
+    # Without it, the "dead" owner may be alive and we would yank its disks.
+    if [ -z "$fence_evidence" ]; then
+        die "refused: recover requires --fence-evidence (fencing must precede takeover)" && exit 1
+    fi
+    local out
+    out=$(resolve_phy "$byid") || exit 1
+    set -- $out
+    local bsg="$1" phy="$2"
+    # hard reset drops the disk's link, releasing a stale affiliation
+    smp_phy_control --phy="$phy" --op=2 "$bsg" >/dev/null 2>&1
+    local rc=$?
+    [ $rc -eq 0 ] || { echo "recover: SMP op=2 failed rc=$rc" >&2; exit 1; }
+    sleep 5
+    local state
+    state=$(aff_state "$bsg" "$phy")
+    case "$state" in
+        "0 "*) echo "recovered: $byid (fence evidence: $fence_evidence)" ;;
+        *) echo "recover: affiliation still held after reset: '$state'" >&2; exit 1 ;;
+    esac
+}
+
+cmd_acquire() {
+    local byid="$1"
+    local out
+    out=$(resolve_phy "$byid") || exit 1
+    set -- $out
+    local bsg="$1" phy="$2"
+    local state
+    state=$(aff_state "$bsg" "$phy")
+    # state format: "<valid> <initiator_addr>"
+    local valid
+    valid=$(echo "$state" | awk '{print $1}')
+    if [ "$valid" = "0" ]; then
+        echo "evidence=affiliation-clear phy=$phy"
+        exit 0
+    fi
+    # affiliated to someone: if it is US and we have the pool, that is also
+    # positive evidence (re-import after crash of self)
+    local addr
+    addr=$(echo "$state" | awk '{print $2}')
+    # HBA initiator ports use base+phy addressing: base=...870, ports ...871-...877.
+    # Compare the 12-digit base prefix, not the full address.
+    myaddr=$(cat /sys/class/sas_phy/phy-*/sas_address 2>/dev/null | sort -u | head -1)
+    mybase=$(echo "$myaddr" | cut -c1-14)
+    addrbase=$(echo "$addr" | cut -c1-14)
+    if [ -n "$addr" ] && [ "$addrbase" = "$mybase" ]; then
+        echo "evidence=affiliation-self phy=$phy"
+        exit 0
+    fi
+    echo "acquire refused: affiliation held by $addr (state: $state)" >&2
+    exit 1
+}
+
+cmd_quiesce() {
+    local byid="$1"
+    local sd
+    sd=$(basename "$(readlink -f "$byid" 2>/dev/null)")
+    [ -n "$sd" ] || { echo "quiesce: cannot resolve $byid" >&2; exit 1; }
+    if [ -e "/sys/block/$sd/device/delete" ]; then
+        echo 1 > "/sys/block/$sd/device/delete" || { echo "quiesce: delete failed" >&2; exit 1; }
+        echo "quiesced: $byid ($sd)"
+    else
+        echo "quiesced (already absent): $byid"
+    fi
+}
+
+cmd_rescan() {
+    local byid="$1"
+    # find the SAS host with expanders and scan it; also handle boot-time
+    # affiliation-conflict drops via a host reset when a plain scan fails
+    local host="" h e
+    for h in /sys/class/sas_host/*; do
+        host=$(basename "$h")
+        for e in /dev/bsg/expander-${host#host}:*; do
+            [ -e "$e" ] && break 2
+        done
+        host=""
+    done
+    [ -n "$host" ] || { echo "rescan: no SAS host" >&2; exit 1; }
+    echo "- - -" > "/sys/class/scsi_host/$host/scan" 2>/dev/null
+    udevadm settle --timeout=30 2>/dev/null
+    if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
+        echo "rescanned: $byid present"
+        exit 0
+    fi
+    # plain scan insufficient (transport dropped it) -> host reset
+    local sg
+    sg=$(ls /dev/bsg/${host#host}:0:0 2>/dev/null | head -1)
+    sg=$(readlink -f "/sys/class/sas_host/$host/device/scsi_host/$host" 2>/dev/null)
+    sg_reset -H "/dev/bsg/${host#host}:0:0" >/dev/null 2>&1 || true
+    sleep 15
+    udevadm settle --timeout=30 2>/dev/null
+    if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
+        echo "rescanned (after host reset): $byid present"
+        exit 0
+    fi
+    echo "rescan: $byid did not reappear" >&2
+    exit 1
+}
+
+cmd_verify() {
+    local byid="$1"
+    local out
+    out=$(resolve_phy "$byid" 2>/dev/null) || { echo "verify: unresolvable"; exit 1; }
+    set -- $out
+    echo "state: $(aff_state "$1" "$2")"
+}
+
+[ $# -ge 1 ] || { echo "usage: $0 <op> <by-id> [args]" >&2; exit 2; }
+OP="$1"; shift
+case "$OP" in
+    probe)   cmd_probe "$@" ;;
+    release) cmd_release "$@" ;;
+    recover) cmd_recover "$@" ;;
+    acquire) cmd_acquire "$@" ;;
+    quiesce) cmd_quiesce "$@" ;;
+    rescan)  cmd_rescan "$@" ;;
+    verify)  cmd_verify "$@" ;;
+    *) echo "unknown op: $OP" >&2; exit 2 ;;
+esac

@@ -1,0 +1,112 @@
+#!/bin/sh
+# zfs-ha: pool.conf writer - records the authoritative pool + disk list at
+# pool-creation time. Run ONCE on the node that creates the pool, then copy
+# the file to the peer (or let the cluster distribute it).
+#
+#   zfs-ha-poolconf write <pool> [--strategy auto|stp|sas|null] \
+#       [--fencing none|bmc|pdu|pikvm|sbd|pr] [--mailbox <by-id>]
+#
+# The resulting /etc/zfs-ha/pool.conf is the single source of truth for every
+# tool (zfsha-pool, zfs-ha-quiesce, zfs-ha-doctor, posture unit). It must
+# NEVER be derived from `zpool status` at runtime - see REVIEW_MODULARITY D1.
+set -u
+
+CONF_DIR="/etc/zfs-ha"
+CONF="$CONF_DIR/pool.conf"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+    echo "usage: $0 write <pool> [--strategy auto|stp|sas|null] [--fencing none|bmc|pdu|pikvm|sbd|pr] [--mailbox <by-id>]" >&2
+    exit 2
+}
+
+[ "${1:-}" = "write" ] || usage
+POOL="${2:-}"
+[ -n "$POOL" ] || usage
+shift 2
+
+STRATEGY="auto"
+FENCING="none"
+MAILBOX=""
+ROLE=""
+PEER=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --strategy) STRATEGY="$2"; shift 2 ;;
+        --fencing)  FENCING="$2";  shift 2 ;;
+        --mailbox)  MAILBOX="$2";  shift 2 ;;
+        --role)     ROLE="$2";     shift 2 ;;
+        --peer)     PEER="$2";     shift 2 ;;
+        *) usage ;;
+    esac
+done
+
+# 1. pool must be imported here to enumerate its disks
+zpool list -H -o name "$POOL" >/dev/null 2>&1 || die "pool '$POOL' not imported on this host"
+
+# 2. enumerate disks by-id (strip -partN), require WWN/by-id paths only
+DISKS=$(zpool status -P "$POOL" 2>/dev/null | grep -oE '/dev/disk/by-id/[^ ]+' \
+        | sed 's/-part[0-9]*$//' | sort -u)
+[ -n "$DISKS" ] || die "no by-id disks found in pool '$POOL' (pool must use by-id paths)"
+for d in $DISKS; do
+    case "$d" in
+        /dev/disk/by-id/*) ;;
+        *) die "non-by-id path in pool: $d (invariant: by-id only)" ;;
+    esac
+done
+
+# 3. strategy preflight (REVIEW_MODULARITY 3.5): sas/null without fencing is a
+#    configuration error - removing the shelf's accidental single-initiator
+#    protection moves the entire safety burden to fencing.
+case "$STRATEGY" in
+    sas|null)
+        case "$FENCING" in
+            none) die "strategy=$STRATEGY requires fencing (sbd|pr|bmc|pdu|pikvm); 'none' is not a safe combination" ;;
+        esac
+        ;;
+    stp|auto) ;;
+    *) die "unknown strategy: $STRATEGY" ;;
+esac
+
+# 3.5 role validation
+if [ -n "$ROLE" ]; then
+    case "$ROLE" in
+        primary|secondary) ;;
+        *) die "role must be primary or secondary, got: $ROLE" ;;
+    esac
+fi
+
+# 4. mailbox sanity (if given, must be by-id and NOT a pool member)
+if [ -n "$MAILBOX" ]; then
+    case "$MAILBOX" in
+        /dev/disk/by-id/*) ;;
+        *) die "mailbox must be a by-id path" ;;
+    esac
+    for d in $DISKS; do
+        [ "$MAILBOX" = "$d" ] && die "mailbox device is a pool member - use a dedicated disk"
+    done
+fi
+
+mkdir -p "$CONF_DIR"
+TMP="$CONF.tmp.$$"
+{
+    echo "# zfs-ha pool configuration - authoritative, written by zfs-ha-poolconf"
+    echo "# $(date -u '+%Y-%m-%dT%H:%M:%SZ') on $(hostname)"
+    echo "pool=$POOL"
+    echo "disks=$DISKS" | tr '\n' ',' | sed 's/,$//; s/^disks=,/disks=/'
+    echo
+    echo "strategy=$STRATEGY"
+    echo "fencing=$FENCING"
+    [ -n "$MAILBOX" ] && echo "mailbox=$MAILBOX"
+    [ -n "$ROLE" ] && echo "role=$ROLE"
+    [ -n "$PEER" ] && echo "peer=$PEER"
+    echo "strict_acquire=yes"
+} > "$TMP"
+
+echo "$DISKS" | while read -r d; do echo "  disk: $d"; done >&2
+mv "$TMP" "$CONF"
+chmod 644 "$CONF"
+echo "wrote $CONF"
+cat "$CONF"

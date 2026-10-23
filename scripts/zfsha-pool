@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""zfs-ha: cluster-aware ZFS pool resource agent (ocf:zfsha:Pool).
+
+Implements the handoff algorithm in docs/HANDBOFF.md:
+  start  = rescan -> acquire (exclusivity evidence) -> import
+  stop   = export -> release -> quiesce (delete devices from OS)
+  monitor= pool health; SUSPENDED is NOT healthy (OCF_NOT_RUNNING)
+
+The disk list comes from /etc/zfs-ha/pool.conf (authoritative, written at
+pool creation) - NEVER from `zpool status` at runtime (REVIEW_MODULARITY D1).
+
+Install as /usr/lib/ocf/resource.d/zfsha/Pool.
+
+OCF parameters:
+  pool        - ZFS pool name (default: from pool.conf)
+  config      - path to pool.conf (default /etc/zfs-ha/pool.conf)
+  handoff     - path to zfs-ha-handoff dispatcher
+  import_opts - extra zpool import options
+"""
+import os
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+OCF_ROOT = os.environ.get("OCF_ROOT", "/usr/lib/ocf")
+HA_BIN = os.environ.get("HA_BIN", "/usr/lib/zfs-ha")
+
+OCF_OK = 0
+OCF_ERR_GENERIC = 1
+OCF_ERR_INSTALLED = 5
+OCF_NOT_RUNNING = 7
+OCF_ERR_CONFIG = 6
+
+
+def run(cmd, **kw):
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    return subprocess.run(cmd, **kw)
+
+
+def ocf_exit(code, reason=""):
+    if reason:
+        print(reason, file=sys.stderr)
+    sys.exit(code)
+
+
+def conf_get(key, env, default=""):
+    """Read a value: OCF param > pool.conf > default."""
+    v = env.get(key, "")
+    if v:
+        return v
+    cfg = env.get("config") or os.path.join("/etc/zfs-ha", "pool.conf")
+    r = run([os.path.join(HA_BIN, "zfs-ha-config"), "get", key],
+            env={**os.environ, "ZFS_HA_CONF": cfg})
+    return r.stdout.strip() if r.returncode == 0 else default
+
+
+def conf_disks(env):
+    cfg = env.get("config") or os.path.join("/etc/zfs-ha", "pool.conf")
+    r = run([os.path.join(HA_BIN, "zfs-ha-config"), "get", "disks"],
+            env={**os.environ, "ZFS_HA_CONF": cfg})
+    if r.returncode != 0 or not r.stdout.strip():
+        return []
+    return r.stdout.strip().split()
+
+
+def pool_imported(pool):
+    r = run(["zpool", "list", "-H", "-o", "name", pool])
+    return r.returncode == 0 and pool in r.stdout.split()
+
+
+def pool_health(pool):
+    r = run(["zpool", "list", "-H", "-o", "health", pool])
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def do_meta_data():
+    ra = ET.Element("resource-agent", {"name": "Pool", "version": "1.1"})
+    ET.SubElement(ra, "version").text = "1.1"
+    longdesc = ET.SubElement(ra, "longdesc", {"lang": "en"})
+    longdesc.text = ("Cluster-managed ZFS pool with pluggable handoff strategy. "
+                     "Disk list from /etc/zfs-ha/pool.conf. start=rescan+acquire"
+                     "+import; stop=export+release+quiesce; SUSPENDED is not "
+                     "running.")
+    ET.SubElement(ra, "shortdesc", {"lang": "en"}).text = "ZFS pool with handoff"
+    params = ET.SubElement(ra, "parameters")
+    for name, req, desc in [
+        ("pool", "0", "ZFS pool name (default from pool.conf)"),
+        ("config", "0", "path to pool.conf"),
+        ("handoff", "0", "path to zfs-ha-handoff dispatcher"),
+        ("import_opts", "0", "extra zpool import options"),
+    ]:
+        p = ET.SubElement(params, "parameter", {"name": name})
+        ET.SubElement(p, "longdesc", {"lang": "en"}).text = desc
+        ET.SubElement(p, "shortdesc", {"lang": "en"}).text = name
+        ET.SubElement(p, "content", {"type": "string"})
+    actions = ET.SubElement(ra, "actions")
+    for a, t in [("start", "300s"), ("stop", "300s"), ("status", "30s"),
+                 ("monitor", "30s"), ("meta-data", "5s"), ("validate-all", "10s")]:
+        ET.SubElement(actions, "action", {"name": a, "timeout": t})
+    print(ET.tostring(ra, encoding="unicode"))
+    return 0
+
+
+def validate(env):
+    pool = conf_get("pool", env)
+    if not pool:
+        ocf_exit(OCF_ERR_CONFIG, "no pool name (OCF param or pool.conf)")
+    cfg = env.get("config") or os.path.join("/etc/zfs-ha", "pool.conf")
+    r = run([os.path.join(HA_BIN, "zfs-ha-config"), "check"],
+            env={**os.environ, "ZFS_HA_CONF": cfg})
+    if r.returncode != 0:
+        ocf_exit(OCF_ERR_CONFIG, f"pool.conf invalid: {r.stdout.strip()}")
+    zpool_found = any(os.path.exists(p) for p in
+                      ("/usr/sbin/zpool", "/sbin/zpool", "/usr/bin/zpool",
+                       "/usr/local/bin/zpool"))
+    if not zpool_found and run(["which", "zpool"]).returncode != 0:
+        ocf_exit(OCF_ERR_INSTALLED, "zpool not found")
+    disks = conf_disks(env)
+    if not disks:
+        ocf_exit(OCF_ERR_CONFIG, "no disks in pool.conf - safety gates cannot run")
+    return pool, disks
+
+
+def handoff_op(env, op, disk, extra=None):
+    """Run the strategy dispatcher; return (rc, stdout+stderr)."""
+    dispatcher = env.get("handoff") or os.path.join(HA_BIN, "zfs-ha-handoff")
+    cmd = [dispatcher, op, disk]
+    if extra:
+        cmd += extra
+    r = run(cmd, timeout=120)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+ALLOW_FLAG = "/run/zfs-ha/allow-import"
+
+
+def action_start(env):
+    pool, disks = validate(env)
+    if pool_imported(pool):
+        print(f"{pool} already imported")
+        return 0
+
+    # Boot-time role arbitration: the secondary host waits for the primary
+    # to come up before attempting import. This prevents the simultaneous
+    # boot affiliation race. See scripts/zfs-ha-role for the algorithm.
+    ha_bin = env.get("handoff", "").rsplit("/", 1)[0] if "/" in (env.get("handoff") or "") else "/usr/lib/zfs-ha"
+    role_r = run([os.path.join(ha_bin, "zfs-ha-role")], timeout=300,
+                 env={**os.environ, "ZFS_HA_CONF": env.get("config") or "/etc/zfs-ha/pool.conf"})
+    if role_r.returncode == 1:
+        # secondary standing down - peer is handling it
+        ocf_exit(OCF_NOT_RUNNING,
+                 f"role arbitration: standing down (peer is primary)")
+    elif role_r.returncode != 0:
+        ocf_exit(OCF_ERR_GENERIC,
+                 f"role arbitration failed: {role_r.stderr.strip()}")
+    # Kill orphaned zpool processes from a previous failed attempt. These
+    # D-state processes hold device references that block the new import
+    # (bdev_open waits for the old holder to release). This is best-effort:
+    # D-state processes may not die, but SIGKILL prevents new ones from
+    # lingering.
+    r = run(["pkill", "-9", "-f", "zpool import"], timeout=10)
+    if r.returncode == 0:
+        print("killed orphaned zpool import process(es)", file=sys.stderr)
+        time.sleep(2)
+    # HANDBOFF steps 7-10: rescan -> acquire (evidence) -> import
+    # The allow-import flag tells the udev quiesce rule to let devices through
+    # (otherwise they are deleted on appearance - boot-time posture).
+    os.makedirs("/run/zfs-ha", exist_ok=True)
+    open(ALLOW_FLAG, "w").write(pool)
+    # NOTE: the flag is intentionally NOT removed on failure - a failed start
+    # may have triggered a host reset that rediscovered devices; removing the
+    # flag would let the udev rule delete them mid-sequence. The flag is
+    # removed only on successful import (below) or by action_stop.
+    # Rescan + acquire with retry policy (HA = retry, then degrade):
+    #   attempt 1-2: full rescan + acquire per disk
+    #   if disks are still missing after retries: import DEGRADED with the
+    #   disks that ARE present (raidz2 tolerates 2 missing; raidz1 tolerates 1).
+    #   A missing disk is logged loudly - the pool runs degraded until the
+    #   disk is replaced (zpool replace).
+    missing = []
+    for attempt in range(1, 4):
+        missing = []
+        for disk in disks:
+            rc, out = handoff_op(env, "rescan", disk)
+            if rc != 0:
+                missing.append(disk)
+                continue
+            rc, out = handoff_op(env, "acquire", disk)
+            if rc != 0:
+                missing.append(disk)
+        if not missing:
+            break
+        print(f"start attempt {attempt}: {len(missing)} disk(s) missing: "
+              + ", ".join(os.path.basename(d) for d in missing))
+        if attempt < 3:
+            time.sleep(3)  # settle before retry
+        if attempt == 2 and missing:
+            # devices still missing after 2 attempts: the mpt3sas transport
+            # likely dropped them at boot (affiliation conflict) and a plain
+            # scan cannot recover them. Force a host reset to recreate the
+            # SCSI targets (MMP_ANALYSIS: sg_reset -H redoes full discovery).
+            print("attempting host reset to recover missing devices",
+                  file=sys.stderr)
+            run(["sg_reset", "-H", "/dev/sg0"], timeout=60)
+            time.sleep(20)  # mpt3sas port enable takes ~10s + udev settle
+
+    present = [d for d in disks if d not in missing]
+    if missing:
+        # determine how many the pool can tolerate from the raidz level
+        # (raidz2: 2, raidz1: 1, mirror: n-1). We use a conservative check:
+        # import with whatever is present and let ZFS decide.
+        print(f"WARNING: {len(missing)} disk(s) unavailable after retries - "
+              "attempting DEGRADED import", file=sys.stderr)
+        for d in missing:
+            print(f"  missing: {d}", file=sys.stderr)
+
+    opts = env.get("import_opts", "").split()
+    r = run(["zpool", "import", "-f"] + opts + [pool], timeout=240)
+    if r.returncode != 0:
+        ocf_exit(OCF_ERR_GENERIC, f"zpool import failed: {r.stderr.strip()}")
+    health = pool_health(pool)
+    if health in ("DEGRADED",):
+        print(f"pool {pool} imported DEGRADED (missing: "
+              + ", ".join(os.path.basename(d) for d in missing) + ")",
+              file=sys.stderr)
+
+    # MMP suspension window: the import completes, then mmp_thread suspends
+    # the pool if MMP writes fail for > mmp_fail_ns (default 10s). Wait for
+    # that window, then clear if suspended (MMP_ANALYSIS Q2/Q3).
+    # zfs_multihost_fail_intervals=0 would disable suspension entirely, but
+    # we keep MMP active as a split-brain backstop and clear instead.
+    for wait in range(6):  # up to ~15s past the 10s MMP window
+        health = pool_health(pool)
+        if health == "SUSPENDED":
+            print("pool SUSPENDED (MMP) - attempting zpool clear", file=sys.stderr)
+            cr = run(["zpool", "clear", pool], timeout=60)
+            if cr.returncode != 0:
+                # EREMOTEIO = peer activity detected - do NOT resume
+                ocf_exit(OCF_ERR_GENERIC,
+                         f"zpool clear failed: {cr.stderr.strip()} "
+                         "(possible peer activity - fencing required)")
+            time.sleep(3)
+            health = pool_health(pool)
+            if health == "SUSPENDED":
+                # clear succeeded but I/O failed again - re-suspended
+                ocf_exit(OCF_ERR_GENERIC,
+                         "pool re-suspended after clear (I/O errors) - "
+                         "check disk paths and fencing")
+            print(f"pool resumed after clear: {health}", file=sys.stderr)
+            break
+        if health in ("ONLINE", "DEGRADED"):
+            # survived the MMP window without suspending
+            break
+        time.sleep(3)
+
+    # success: remove the flag so the udev rule resumes quiescing new devices
+    try:
+        os.unlink(ALLOW_FLAG)
+    except FileNotFoundError:
+        pass
+    # sharenfs datasets need nfs-server running to serve exports
+    run(["systemctl", "start", "nfs-server"], timeout=60)
+    return 0
+
+
+def action_stop(env):
+    pool, disks = validate(env)
+    try:
+        os.unlink(ALLOW_FLAG)
+    except FileNotFoundError:
+        pass
+    # Kill orphaned zpool processes before quiescing (they hold device refs)
+    run(["pkill", "-9", "-f", "zpool import"], timeout=10)
+    if not pool_imported(pool):
+        # not imported: still quiesce (delete devices) if present - a DIRTY
+        # host must not keep devices in its OS
+        for disk in disks:
+            handoff_op(env, "quiesce", disk)
+        return 0
+    # HANDBOFF steps 1-4: export -> release -> quiesce.
+    # Order per REVIEW_MODULARITY D6: resolve mappings first (handoff ops do
+    # this internally), quiesce (delete from OS) BEFORE release so nothing
+    # re-affiliates between release and delete.
+    # sharenfs datasets are NFS-exported by the kernel nfsd, which holds the
+    # dataset mount. Unmount them (and stop nfs-server) before export.
+    run(["zfs", "unmount", "-a"], timeout=60)
+    run(["systemctl", "stop", "nfs-server"], timeout=60)
+    r = run(["zpool", "export", pool], timeout=180)
+    if r.returncode != 0:
+        ocf_exit(OCF_ERR_GENERIC,
+                 f"zpool export failed (stuck export?): {r.stderr.strip()} - "
+                 "fencing required before takeover")
+    for disk in disks:
+        rc, out = handoff_op(env, "quiesce", disk)
+        if rc != 0:
+            ocf_exit(OCF_ERR_GENERIC, f"quiesce failed for {disk}: {out}")
+    for disk in disks:
+        rc, out = handoff_op(env, "release", disk)
+        if rc != 0:
+            ocf_exit(OCF_ERR_GENERIC, f"release failed for {disk}: {out}")
+    return 0
+
+
+def action_monitor(env):
+    pool, disks = validate(env)
+    if not pool_imported(pool):
+        ocf_exit(OCF_NOT_RUNNING)
+    health = pool_health(pool)
+    if health == "SUSPENDED":
+        # MMP tripped: ownership ambiguous, data path dead. Must NOT report
+        # running - pacemaker must escalate (restart -> failed stop -> fence).
+        ocf_exit(OCF_NOT_RUNNING, f"pool {pool} SUSPENDED (MMP) - not running")
+    if health in ("DEGRADED", "ONLINE"):
+        return 0
+    # FAULTED/UNAVAIL/unknown: not serving data
+    ocf_exit(OCF_NOT_RUNNING, f"pool {pool} health={health}")
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else ""
+    env = {k: os.environ.get("OCF_RESKEY_" + k, "")
+           for k in ("pool", "config", "handoff", "import_opts")}
+    if action == "meta-data":
+        sys.exit(do_meta_data())
+    if action == "validate-all":
+        validate(env)
+        sys.exit(OCF_OK)
+    if action == "start":
+        sys.exit(action_start(env))
+    if action == "stop":
+        sys.exit(action_stop(env))
+    if action in ("status", "monitor"):
+        sys.exit(action_monitor(env))
+    ocf_exit(OCF_ERR_GENERIC, f"unknown action: {action}")
+
+
+if __name__ == "__main__":
+    main()

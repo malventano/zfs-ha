@@ -1,0 +1,222 @@
+# Validation Record
+
+Hardware used for validation (reference implementation):
+
+| Item | Detail |
+|---|---|
+| Hosts | 2x commodity desktop, Rocky Linux 10.2, kernel 6.12 |
+| HBAs | 2x LSI SAS9300-8e (SAS3008), mpt3sas 54.100.00.00 |
+| Shelf | NetApp DS460C, 60-bay, 2x IOM12 modules |
+| Disks | 13x SATA (9x 3TB HDD, 2x 960GB SSD, 1TB, 480GB SSD) |
+| ZFS | OpenZFS 2.2.11 (kmod) |
+| Cluster | pacemaker 3.0.1, corosync 3.1.10, pcs 0.12.2 |
+
+All tests were read-only or confined to a single sacrificial disk (bay 6,
+ST3000DM001) with marker writes to sector 100 only. No filesystems or pools
+were created on production data.
+
+## V1. Shelf topology discovery
+
+- `utils/sas_topology.sh` enumerates: 2 hosts, 1 shared IOM (both hosts
+  cable into the same IOM12A; second IOM present but unconnected), 5
+  downstream expanders, 13 disks with bay/WWN/phy/affiliation mapping.
+- SES pages (`sg_ses`) confirm enclosure identity, slot states, PSU status.
+
+## V2. Affiliation semantics (the core mechanism)
+
+- `smp_rep_phy_sata` reports per-phy: `affiliations supported: 1`,
+  `affiliation valid`, `affiliated STP initiator SAS address`.
+- Confirmed from **both** hosts: the affiliation state is global (shelf-side),
+  not per-host.
+- `maximum affiliation contexts: 1` — hardware-enforced single-initiator per
+  SATA disk. This is why the shelf "rejects simultaneous commands": the
+  second host's I/O fails with `DID_SOFT_ERROR` and 15s stalls.
+
+## V3. Clean handoff round-trip (S1)
+
+| Step | Result |
+|---|---|
+| A writes marker to sector 100 | OK |
+| Clear affiliation (PHY CONTROL op 6, from A) | `affiliation valid: 0` |
+| B reads sector 100 | A's marker, byte-identical |
+| B writes its own marker | OK |
+| Clear affiliation (from B) | `affiliation valid: 0` |
+| A reads (after `sg_reset -d`) | B's marker, byte-identical |
+
+**Data integrity across the full A→B→A cycle: verified.**
+
+## V4. Old-owner behavior after affiliation loss
+
+- Old owner's reads **hang** (SCSI 180s timeout, process in D-state) rather
+  than failing fast.
+- Recovery requires `sg_reset -d <disk>` (SCSI device reset).
+- Design consequence: the handoff procedure must quiesce I/O *before*
+  releasing the affiliation (clean export does this), and the new owner must
+  reset devices during acquire. A hung export in a failure scenario requires
+  fencing before takeover (S5).
+
+## V5. Crash recovery (S2) — wedged owner
+
+Simulated owner death by unbinding the HBA driver mid-operation (driver
+stuck unloading, host OS alive):
+
+- Expander **still reports `affiliation valid: 1`** for the wedged owner —
+  its phys remain electrically up.
+- Clear-affiliation (op 6) from the survivor is **refused**
+  (`Phy control result: Affiliation violation`, affiliation stays valid).
+- **Recovery works via PHY CONTROL hard reset (op 2)** on the disk phy:
+  drops the disk's link → releases the stale affiliation → survivor
+  re-affiliates on its next I/O → data intact.
+- `STP I_T nexus loss occurred` did **not** fire (phys stayed up) — so
+  crash detection must rely on I/O failure + affiliation state, not the
+  nexus-loss bit alone.
+
+## V6. Power-loss detection (S3, partial)
+
+- The `STP I_T nexus loss occurred` bit is the expected signal when a host
+  actually loses power (phys go down). Full validation of the S3 runbook
+  requires a physical power-off, which is a manual step (or PDU/BMC fencing
+  agent execution) — the runbook in `tests/S3_power_loss.sh` documents the
+  exact procedure and expected observations.
+
+## V7. Cluster behavior
+
+- Dual-ring corosync: ring 0 on the client LAN, ring 1 on a private
+  192.168.50.0/24 subnet via IP aliases. Both links `connected` on both
+  nodes; `link_mode=active` (both links used simultaneously).
+- Two-node quorum: `two_node: 1`, `Quorate: Yes`,
+  `Flags: 2Node Quorate WaitForAll`.
+- Both nodes Online, DC elected, resources startable.
+- S4/S6 (partition, simultaneous boot) are documented runbooks; their
+  expected behavior follows from standard corosync/pacemaker semantics and
+  the import-prevention configuration in HOWTO §5.
+
+## V8. Tooling
+
+- `smp_send` (raw SMP via bsg): validated against REPORT GENERAL, DISCOVER,
+  REPORT PHY SATA, SET PHY SATA, PHY CONTROL — responses match smp_utils
+  output byte-for-byte. Works from either host against any expander.
+- Python ctypes bsg access **segfaults on Python 3.14** (EFAULT from the
+  kernel on the same ioctl that works from C) — use the C tool.
+
+## Known limitations
+
+1. **Second IOM path**: the reference shelf's second IOM is not cabled to
+   either host, so there is no redundant shelf path. This does not affect
+   the handoff mechanism (affiliation is per-disk, not per-path) but means
+   the shelf IOM is a single point of failure in the reference setup.
+2. **SBD**: not validated (no SAS disk in the shelf yet). The design treats
+   SBD as an optional enhancement via a dedicated SAS disk.
+3. **S3/S4/S6 full execution**: runbooks documented; full automated
+   execution requires power control (PDU/BMC) which is part of the fencing
+   phase.
+4. **SMP PHY CONTROL on live disks**: clearing an affiliation while the
+   owner is doing I/O will hang the owner's I/O (see V4). Only release
+   affiliations for exported/idle pools, or after fencing.
+
+## V9. ZFS pool layouts (RAIDZ1 / RAIDZ2) with multi-GB data
+
+Tested on host B (host A down for power cycle at the time). Disks: 4x
+WD30EFRX 3TB (bays 1, 5, 7, 11), affiliation-cleared via phy hard reset
+after the previous owner's stale affiliations.
+
+### RAIDZ1 (3 disks, ~5.4T usable)
+
+- Pool created with `multihost=on`, separate cachefile
+  (`/etc/zfs/zpool.cachefile.ha`) for boot-import prevention.
+- 5x 1GB random files written (dd from /dev/urandom), sha256 recorded.
+- **All 5 files verified OK** after write.
+- Pool exported → affiliations cleared → pool re-imported (with phy hard
+  resets in between) → **all 5 files verified OK again**.
+- During re-import the pool briefly entered **SUSPENDED** state:
+  `multihost=on` MMP detected its own writes failing while the disk phys
+  were being reset. `zpool clear` resumed it. This is the multihost safety
+  net working as designed - it refuses to continue when it cannot prove
+  exclusive ownership.
+
+### RAIDZ2 (4 disks, ~5.2T usable)
+
+- Same 4-disk set, `raidz2` vdev. 5x 1GB random files, sha256 verified OK.
+- **Degraded-mode test**: one disk offlined (`zpool offline`) → pool DEGRADED
+  → all 5 files still verified OK (2-disk parity). Disk re-onlined →
+  resilvered 120K with 0 errors → pool ONLINE.
+
+### Conclusions
+
+- Both RAIDZ1 and RAIDZ2 layouts work correctly on the shared shelf with
+  the handoff mechanism, including export/import cycles through
+  affiliation churn.
+- `multihost=on` MMP correctly detects ambiguous ownership during phy
+  resets and suspends rather than risk corruption. Handoff procedures must
+  sequence: export → clear affiliations → (phy resets settle) → import on
+  the new owner, and expect a possible `zpool clear` if MMP tripped during
+  the transition.
+- Degraded-mode reads work as expected; resilver is clean on re-online.
+
+## V10. Live handoff practice (both hosts up) - MMP deadlock findings
+
+Practiced real pool handoffs with both hosts powered and contending for the
+disks (the realistic failure-adjacent case). Findings that only appear when
+both hosts are alive:
+
+### 1. Alive hosts re-affiliate constantly
+
+Any I/O from a host re-affiliates an unaffiliated disk. Background probes
+(udev, SMART polling, MMP retries) grab disks within seconds. A handoff
+window must be coordinated: the outgoing owner releases and the incoming
+owner imports immediately. This is exactly what Pacemaker provides -
+manual handoff between two live hosts is inherently racy.
+
+### 2. An owner can clear its own affiliation (op=6)
+
+Confirmed: a live host can release its own disks via PHY CONTROL op=6.
+It cannot clear another live host's affiliation (op=6 refused), and a
+wedged host's affiliation needs op=2 (hard reset) - see V5.
+
+### 3. mpt3sas drops affiliation-conflict disks at boot
+
+If a disk is affiliated to another host when this host boots, mpt3sas logs
+"discovery errors(sata affiliation conflict)" and drops the disk from
+discovery entirely - no sd node, no by-id link. Recovery requires a phy
+hard reset (op=2) followed by a host-level reset (sg_reset -H) to trigger
+rediscovery; a plain SCSI scan ("echo '- - -' > scan") is NOT sufficient
+because the transport layer dropped the device.
+
+### 4. MMP suspend deadlock after a failed import
+
+If an import suspends (MMP writes failed during disk settle), the importing
+host cannot export ("pool I/O is currently suspended") or clear ("pool is
+imported on a different host"), and its kernel keeps retrying MMP writes -
+which re-affiliates the disks, blocking the other host's import in D-state.
+The deadlock breaker observed:
+
+- The host whose MMP state matches the on-disk state imports cleanly.
+- That host then exports cleanly, resetting the MMP chain.
+- The other host can then import.
+
+If neither can proceed (state mismatch + suspended import), the importing
+host must be power-cycled to clear the in-kernel suspended import.
+
+### 5. Correct handoff procedure (updated)
+
+```
+OUTGOING OWNER                          INCOMING OWNER
+1. zpool export <pool>
+2. release own affiliations (op=6)
+3. (disks now idle - do not touch)
+                                        4. verify affiliations clear
+                                        5. sg_reset -d each disk
+                                        6. zpool import -f <pool>
+                                        7. if SUSPENDED: settle longer,
+                                           retry; if MMP-deadlocked, have the
+                                           old owner import+export once
+```
+
+Key: step 2 and step 6 must be close in time, and the outgoing owner must
+not touch the disks after step 2 (stop smartd/udisks2 or fence it).
+
+### 6. Data integrity
+
+Across all the churn in this session (multiple imports/exports, phy resets,
+MMP suspends, one host power cycle), every sha256 verification of the 5GB
+test dataset passed. No corruption at any point.

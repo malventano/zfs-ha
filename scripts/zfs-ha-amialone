@@ -1,0 +1,181 @@
+#!/bin/sh
+# zfs-ha: "am I alone?" gate.
+#
+# Implements the safe decision procedure from docs/REVIEW_MODULARITY.md 4.6.
+# This is a GATE, not a promoter. Its only outputs:
+#   NOT_ALONE       - cluster is alive; do nothing, follow pacemaker
+#   ABSTAIN         - ambiguous; alert operator; import nothing
+#   FENCE_FIRST     - peer alive-ish but silent; invoke fencing
+#   FENCED_PROCEED  - peer verifiably off; hand to pacemaker for promotion
+#
+# It NEVER imports, never starts resources, never configures an IP.
+# Promotion happens only via pacemaker after a verified fence.
+#
+# Signals (all corroborating, none sole):
+#   corosync link state (knet)          primary liveness signal
+#   carrier per link                    physical path state
+#   mailbox peer_age                    SAS-disk second confirmation path
+#   peer storage activity               affiliations held by peer's SAS addr
+#   BMC power readback                  the only death proof
+#
+# Usage: zfs-ha-amialone [--verbose]
+# Exit: 0 = NOT_ALONE/FENCED_PROCEED (safe), 1 = ABSTAIN/FENCE_FIRST (unsafe to act)
+set -u
+
+CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
+SMP="${SMP_PATH:-/usr/local/bin}"
+export PATH="$SMP:$PATH"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/lib}"
+
+T_SILENCE="${T_SILENCE:-15}"        # seconds of corosync silence before "peer not talking"
+T_MAILBOX_STALE="${T_MAILBOX_STALE:-30}"
+T_OBSERVE="${T_OBSERVE:-30}"        # min observation window before FENCE_FIRST
+
+VERBOSE="${1:-}"
+log() { echo "gate: $*"; }
+
+# --- signal: corosync links ---
+# Count a link as connected only if every nodeid in its block is "connected"
+# (N2 fix: grep -c "connected" counted "disconnected" too).
+knet_connected=0
+knet_total=0
+if command -v corosync-cfgtool >/dev/null 2>&1; then
+    out=$(corosync-cfgtool -s 2>/dev/null)
+    knet_total=$(echo "$out" | grep -c "LINK ID")
+    if [ "$knet_total" -gt 0 ]; then
+        block=""
+        while IFS= read -r line; do
+            case "$line" in
+                "LINK ID"*)
+                    if [ -n "$block" ]; then
+                        if ! echo "$block" | grep -q "disconnected"; then
+                            knet_connected=$((knet_connected+1))
+                        fi
+                    fi
+                    block="$line"
+                    ;;
+                *) block="$block
+$line" ;;
+            esac
+        done <<MCEOF
+$out
+MCEOF
+        if [ -n "$block" ] && ! echo "$block" | grep -q "disconnected"; then
+            knet_connected=$((knet_connected+1))
+        fi
+    fi
+fi
+
+# --- signal: carrier per cluster interface ---
+carrier_down=0
+carrier_total=0
+for ifc in $(grep -E '^interface=' "$CONF" 2>/dev/null | cut -d= -f2- | tr ',' ' '); do
+    carrier_total=$((carrier_total+1))
+    c=$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null || echo 0)
+    [ "$c" = "0" ] && carrier_down=$((carrier_down+1))
+done
+
+# --- signal: mailbox peer age (SAS second confirmation path) ---
+mailbox_age=-1
+mailbox_state="UNAVAILABLE"
+if [ -f "$CONF" ] && grep -qE '^mailbox=' "$CONF"; then
+    out=$(/usr/lib/zfs-ha/zfs-ha-mailbox status 2>/dev/null)
+    mailbox_state=$(echo "$out" | grep -oE "peer_state=[A-Z]+" | cut -d= -f2)
+    mailbox_age=$(echo "$out" | grep -oE "peer_age=-?[0-9]+" | cut -d= -f2)
+fi
+
+# --- signal: peer storage activity (affiliations held by peer's SAS addr) ---
+peer_storage_active=0
+peer_sas_addr=""
+if [ -f "$CONF" ]; then
+    peer_sas_addr=$(grep -E '^peer_sas_addr=' "$CONF" | head -1 | cut -d= -f2-)
+fi
+if [ -n "$peer_sas_addr" ] && command -v smp_rep_phy_sata >/dev/null 2>&1; then
+    for e in /dev/bsg/expander-*; do
+        [ -e "$e" ] || continue
+        for phy in $(seq 0 15); do
+            a=$(smp_rep_phy_sata --phy="$phy" "$e" 2>/dev/null \
+                | grep "affiliated STP initiator" | awk '{print $NF}')
+            if [ "$a" = "$peer_sas_addr" ]; then
+                peer_storage_active=1
+                break 2
+            fi
+        done
+    done
+fi
+
+# --- signal: BMC power readback (only death proof) ---
+bmc_power="unknown"
+if [ -f "$CONF" ] && command -v ipmitool >/dev/null 2>&1; then
+    bmc_host=$(grep -E '^peer_bmc=' "$CONF" | head -1 | cut -d= -f2-)
+    if [ -n "$bmc_host" ]; then
+        # N3 fix: parse only the exact "Chassis Power is on/off" line; any
+        # error/timeout output leaves bmc_power=unknown (fail safe)
+        bmc_out=$(ipmitool -H "$bmc_host" -U "$(grep peer_bmc_user= "$CONF" | cut -d= -f2-)" \
+            -P "$(grep peer_bmc_pass= "$CONF" | cut -d= -f2-)" chassis power status 2>/dev/null)
+        case "$bmc_out" in
+            *"Chassis Power is on"*)  bmc_power="on" ;;
+            *"Chassis Power is off"*) bmc_power="off" ;;
+            *) bmc_power="unknown" ;;
+        esac
+    fi
+fi
+
+# --- decision procedure (REVIEW_MODULARITY 4.6) ---
+verdict="ABSTAIN"
+reason=""
+
+# 1. Positive evidence of a living cluster: never alone.
+if [ "$knet_connected" -gt 0 ]; then
+    verdict="NOT_ALONE"
+    reason="corosync link connected ($knet_connected/$knet_total)"
+else
+    # 2. Storage-side veto: peer's SAS stack demonstrably alive.
+    if [ "$peer_storage_active" = "1" ]; then
+        verdict="ABSTAIN"
+        reason="peer SAS address still holds affiliations (peer_storage_active) - hard veto"
+    elif [ "$carrier_down" -eq "$carrier_total" ] && [ "$carrier_total" -gt 0 ]; then
+        # all carriers down: symmetric ambiguity (my NICs vs peer) - never promote
+        verdict="ABSTAIN"
+        reason="all cluster carriers down - cannot distinguish my-NIC-death from peer-death"
+    elif [ "$mailbox_state" = "ALIVE" ]; then
+        verdict="ABSTAIN"
+        reason="mailbox says peer beat ${mailbox_age}s ago - peer alive at the shelf"
+    elif [ "$bmc_power" = "off" ]; then
+        verdict="FENCED_PROCEED"
+        reason="BMC verifies peer power OFF - hand to pacemaker for promotion"
+    elif [ "$bmc_power" = "on" ]; then
+        verdict="FENCE_FIRST"
+        reason="BMC says peer is powered but silent on all links - fence it"
+    elif [ "$mailbox_state" = "STALE" ] && [ "$mailbox_age" -ge 0 ]; then
+        # mailbox stale + corosync silent + no storage activity + no BMC:
+        # corroborated absence, but no death proof -> still abstain (or fence
+        # if fencing is configured)
+        f=$(grep -E '^fencing=' "$CONF" 2>/dev/null | cut -d= -f2-)
+        case "$f" in
+            bmc|pdu|pikvm|sbd|pr)
+                verdict="FENCE_FIRST"
+                reason="corosync silent + mailbox stale ($mailbox_age s) + no storage activity; fencing=$f configured"
+                ;;
+            *)
+                verdict="ABSTAIN"
+                reason="corosync silent + mailbox stale but NO fencing configured - cannot confirm death"
+                ;;
+        esac
+    else
+        verdict="ABSTAIN"
+        reason="insufficient corroboration (knet=$knet_connected/$knet_total carrier_down=$carrier_down/$carrier_total mailbox=$mailbox_state bmc=$bmc_power)"
+    fi
+fi
+
+if [ "$VERBOSE" = "--verbose" ]; then
+    log "knet=$knet_connected/$knet_total carrier_down=$carrier_down/$carrier_total"
+    log "mailbox=$mailbox_state age=${mailbox_age}s"
+    log "peer_storage_active=$peer_storage_active bmc_power=$bmc_power"
+fi
+log "verdict=$verdict ($reason)"
+
+case "$verdict" in
+    NOT_ALONE|FENCED_PROCEED) exit 0 ;;
+    *) exit 1 ;;
+esac

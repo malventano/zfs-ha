@@ -1,0 +1,45 @@
+#!/bin/sh
+# zfs-ha: udev add-hook for HA pool devices.
+#
+# Called by the udev rule (69-zfs-ha-quiesce.rules) the instant an HA-pool
+# disk device appears. Decides whether the device may exist in the OS:
+#
+#   /run/zfs-ha/allow-import exists  -> do nothing (the RA is rescanning
+#                                       for a deliberate import)
+#   otherwise                        -> DELETE the device immediately
+#
+# Rationale: at boot, neither host knows if it is primary. The safe default
+# is to remove the devices from the OS before anything can probe them
+# (blkid, SMART polling, udev probes, zpool import). This stops the dmesg
+# spam of I/O errors and prevents the racy re-affiliation behavior. A host
+# that should own the pool gets the devices back via the RA's rescan (which
+# sets the allow-import flag first).
+#
+# Environment from udev: DEVPATH, ID_WWN, DEVNAME
+set -u
+
+ALLOW_FLAG="/run/zfs-ha/allow-import"
+LOG_TAG="zfs-ha-udev"
+
+# allow-import flag: RA is deliberately rescanning; let the device through
+if [ -f "$ALLOW_FLAG" ]; then
+    logger -t "$LOG_TAG" "allow-import active: permitting $DEVPATH"
+    exit 0
+fi
+
+# delete the device from the OS
+devnode="/sys${DEVPATH%/block/*}/block/$(basename "$DEVNAME" 2>/dev/null)"
+# DEVPATH is like /devices/pci.../block/sdb; the delete attr is:
+del_attr="/sys${DEVPATH}/device/delete"
+if [ -e "$del_attr" ]; then
+    echo 1 > "$del_attr" 2>/dev/null
+    logger -t "$LOG_TAG" "quiesced (deleted) $DEVNAME ($ID_WWN)"
+else
+    # fallback: find via /sys/block
+    sd=$(basename "$DEVNAME" 2>/dev/null)
+    if [ -n "$sd" ] && [ -e "/sys/block/$sd/device/delete" ]; then
+        echo 1 > "/sys/block/$sd/device/delete" 2>/dev/null
+        logger -t "$LOG_TAG" "quiesced (deleted) $sd ($ID_WWN)"
+    fi
+fi
+exit 0

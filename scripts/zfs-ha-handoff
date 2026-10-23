@@ -1,0 +1,56 @@
+#!/bin/sh
+# zfs-ha: handoff strategy dispatcher.
+#
+#   zfs-ha-handoff <op> <by-id-disk> [args]
+#
+# Resolves the strategy from pool.conf (strategy=auto probes the disk), then
+# execs strategies.d/<name>/handoff <op> <by-id> [args].
+#
+# Ops (contract in docs/REVIEW_MODULARITY.md 3.3):
+#   probe <by-id>                    emit key=value capability lines
+#   release <by-id>                  clear THIS host's access (fail closed)
+#   recover <by-id> [--fence-evidence T]   aggressive recovery of dead owner
+#   acquire <by-id>                  exclusivity gate; prints evidence= on ok
+#   quiesce <by-id>                  remove from OS visibility
+#   rescan <by-id>                   bring back; non-zero if not reappeared
+#   verify <by-id>                   post-condition check
+set -u
+
+HA_BIN="${HA_BIN:-/usr/lib/zfs-ha}"
+CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+[ -f "$CONF" ] || die "$CONF missing (run zfs-ha-poolconf write)"
+[ $# -ge 2 ] || { echo "usage: $0 <op> <by-id-disk> [args]" >&2; exit 2; }
+
+OP="$1"; DISK="$2"; shift 2
+
+case "$DISK" in
+    /dev/disk/by-id/*) ;;
+    *) die "by-id paths only (invariant); got: $DISK" ;;
+esac
+
+STRATEGY=$(grep -E '^strategy=' "$CONF" | head -1 | cut -d= -f2-)
+[ -n "$STRATEGY" ] || die "no strategy in $CONF"
+
+# auto: probe the disk and pick
+if [ "$STRATEGY" = "auto" ]; then
+    for cand in stp sas null; do
+        p="$HA_BIN/strategies.d/$cand/handoff"
+        [ -x "$p" ] || continue
+        if "$p" probe "$DISK" 2>/dev/null | grep -q "affiliation_enforced=yes"; then
+            STRATEGY="$cand"
+            break
+        fi
+    done
+    # default fallback: no affiliation enforced anywhere -> null
+    if [ "$STRATEGY" = "auto" ]; then
+        STRATEGY=null
+    fi
+fi
+
+PLUGIN="$HA_BIN/strategies.d/$STRATEGY/handoff"
+[ -x "$PLUGIN" ] || die "strategy '$STRATEGY' plugin missing/not executable: $PLUGIN"
+
+exec "$PLUGIN" "$OP" "$DISK" "$@"

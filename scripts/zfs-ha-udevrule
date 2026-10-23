@@ -1,0 +1,65 @@
+#!/bin/sh
+# zfs-ha: generate the udev quiesce rule from pool.conf.
+#
+# Run once after zfs-ha-poolconf write (and after any pool disk change):
+#   zfs-ha-udevrule generate
+#   zfs-ha-udevrule remove
+#
+# The rule deletes HA-pool disk devices the instant they appear, unless
+# /run/zfs-ha/allow-import exists (RA import in progress). This stops the
+# boot-time I/O error spam and the racy re-affiliation: the OS never gets
+# to probe the drives.
+#
+# The rule matches on ID_WWN (udev's own WWN detection), so it works
+# regardless of sdX enumeration.
+set -u
+
+RULE="/etc/udev/rules.d/69-zfs-ha-quiesce.rules"
+CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
+HA_BIN="${HA_BIN:-/usr/lib/zfs-ha}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+cmd_generate() {
+    [ -f "$CONF" ] || die "$CONF missing (run zfs-ha-poolconf write)"
+    DISKS=$(grep -E '^disks=' "$CONF" | head -1 | cut -d= -f2- | tr ',' ' ')
+    [ -n "$DISKS" ] || die "no disks in $CONF"
+
+    # extract WWNs from by-id paths (wwn-0x... or scsi-3...)
+    WWNS=""
+    for d in $DISKS; do
+        base=$(basename "$d")
+        case "$base" in
+            wwn-0x*)  wwn="${base#wwn-0x}";  WWNS="$WWNS $wwn" ;;
+            scsi-3*)  wwn="${base#scsi-3}";  WWNS="$WWNS $wwn" ;;
+            *) die "cannot extract WWN from $d (by-id wwn- or scsi-3 paths only)" ;;
+        esac
+    done
+    [ -n "$WWNS" ] || die "no WWNs extracted"
+
+    {
+        echo "# zfs-ha: quiesce HA pool devices on appearance (generated)"
+        echo "# pool: $(grep -E '^pool=' "$CONF" | cut -d= -f2-)"
+        echo "# regenerate: zfs-ha-udevrule generate"
+        # udev matches ENV{ID_WWN} without the 0x prefix
+        for wwn in $WWNS; do
+            # udev ID_WWN includes the 0x prefix; match with a leading wildcard
+            echo "ACTION==\"add\", SUBSYSTEM==\"block\", ENV{ID_WWN}==\"*$wwn\", RUN+=\"$HA_BIN/zfs-ha-udev-delete\""
+        done
+    } > "$RULE.tmp"
+    mv "$RULE.tmp" "$RULE"
+    chmod 644 "$RULE"
+    echo "wrote $RULE ($(echo $WWNS | wc -w) WWNs)"
+    echo "reload: udevadm control --reload"
+}
+
+cmd_remove() {
+    rm -f "$RULE"
+    echo "removed $RULE"
+}
+
+case "${1:-}" in
+    generate) cmd_generate ;;
+    remove)   cmd_remove ;;
+    *) echo "usage: $0 {generate|remove}" >&2; exit 2 ;;
+esac

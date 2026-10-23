@@ -1,0 +1,100 @@
+#!/bin/sh
+# zfs-ha: quiesce / rediscover HA pool devices on this host.
+#
+#   zfs-ha-quiesce delete   [pool]   remove all HA-pool devices from the OS
+#   zfs-ha-quiesce rescan   [pool]   rescan and re-add them
+#   zfs-ha-quiesce status   [pool]   report which devices are present
+#
+# The disk list comes from /etc/zfs-ha/pool.conf (authoritative, written at
+# pool creation) - NEVER from `zpool status` at runtime (REVIEW_MODULARITY D1:
+# zpool status fails when the pool is not imported, which is exactly when the
+# quiesce matters).
+#
+# "delete" is the anti-race primitive: a deleted device has no sd node, no
+# by-id link, and cannot be probed by udev/smartd/MMP. It cannot return
+# except via an explicit rescan. A secondary host keeps its HA devices
+# deleted at all times; a primary deletes them during handoff.
+set -u
+
+HA_BIN="${HA_BIN:-/usr/lib/zfs-ha}"
+CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
+
+conf_disks() {
+    [ -f "$CONF" ] || { echo "ERROR: $CONF missing (run zfs-ha-poolconf write)" >&2; return 1; }
+    grep -E '^disks=' "$CONF" | head -1 | cut -d= -f2- | tr ',' ' '
+}
+
+conf_pool() {
+    [ -f "$CONF" ] || { echo "ERROR: $CONF missing" >&2; return 1; }
+    grep -E '^pool=' "$CONF" | head -1 | cut -d= -f2-
+}
+
+cmd_delete() {
+    local rc=0
+    for disk in $(conf_disks); do
+        local sd
+        sd=$(basename "$(readlink -f "$disk" 2>/dev/null)")
+        [ -z "$sd" ] && continue
+        if [ -e "/sys/block/$sd/device/delete" ]; then
+            echo 1 > "/sys/block/$sd/device/delete" 2>/dev/null \
+                && echo "deleted: $disk ($sd)" \
+                || { echo "FAILED to delete $disk ($sd)"; rc=1; }
+        else
+            echo "already absent: $disk"
+        fi
+    done
+    return $rc
+}
+
+cmd_rescan() {
+    local host="" h e
+    for h in /sys/class/sas_host/*; do
+        host=$(basename "$h")
+        for e in /dev/bsg/expander-${host#host}:*; do
+            [ -e "$e" ] && break 2
+        done
+        host=""
+    done
+    [ -n "$host" ] || { echo "no SAS host found"; return 1; }
+    echo "- - -" > "/sys/class/scsi_host/$host/scan"
+    udevadm settle --timeout=30 2>/dev/null
+    local n=0 total=0
+    for disk in $(conf_disks); do
+        total=$((total+1))
+        if [ -e "$(readlink -f "$disk" 2>/dev/null)" ]; then
+            n=$((n+1))
+            echo "present: $disk"
+        else
+            echo "absent:  $disk"
+        fi
+    done
+    echo "rescanned: $n/$total present"
+    [ "$n" -eq "$total" ]
+}
+
+cmd_status() {
+    local present=0 total=0
+    for disk in $(conf_disks); do
+        total=$((total+1))
+        if [ -e "$(readlink -f "$disk" 2>/dev/null)" ]; then
+            present=$((present+1))
+            echo "present:  $disk"
+        else
+            echo "deleted:  $disk"
+        fi
+    done
+    echo "total: $present/$total present"
+    if [ "$present" -eq 0 ]; then
+        echo "host is QUIESCED (secondary posture)"
+    else
+        echo "host has devices (primary or dirty posture)"
+    fi
+}
+
+[ $# -ge 1 ] || { echo "usage: $0 {delete|rescan|status} [pool]" >&2; exit 2; }
+case "$1" in
+    delete) cmd_delete ;;
+    rescan) cmd_rescan ;;
+    status) cmd_status ;;
+    *) echo "unknown command: $1" >&2; exit 2 ;;
+esac

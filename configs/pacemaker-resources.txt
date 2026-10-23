@@ -1,0 +1,44 @@
+#!/bin/sh
+# zfs-ha: example Pacemaker resource configuration.
+#
+# This is a TEMPLATE - replace placeholders before use:
+#   <POOL_NAME>      - your ZFS pool name
+#   <VIP>            - floating service IP
+#   <VIP_NIC>        - network interface for the VIP
+#   <FENCE_AGENT>    - fencing resource (see docs/FENCING.md)
+#
+# Fencing MUST be configured and tested before enabling the pool resource.
+# The stonith-enabled=false line below is for initial bring-up ONLY.
+#
+# Apply with: pcs resource create ... or paste into a pcs config file.
+
+# --- fencing (REQUIRED before production; placeholder shown) ---
+# pcs stonith create fence_node_a <FENCE_AGENT> pcmk_host_list=<node_a> ...
+# pcs stonith create fence_node_b <FENCE_AGENT> pcmk_host_list=<node_b> ...
+
+# --- ZFS pool with handoff-aware RA ---
+# The Pool RA (scripts/zfsha-pool) verifies stale-affiliation release before
+# import and exports cleanly before release.
+#
+# pcs resource create ha_pool ocf:zfsha:Pool pool=<POOL_NAME> \
+#     op start timeout=180s op stop timeout=180s op monitor timeout=30s interval=30s
+#
+# --- VIP ---
+# pcs resource create ha_vip ocf:heartbeat:IPaddr2 ip=<VIP> nic=<VIP_NIC> cidr_netmask=24
+#
+# --- colocation + ordering: VIP follows the pool ---
+# pcs constraint colocation add ha_vip with ha_pool INFINITY
+# pcs constraint order start ha_pool then start ha_vip kind=Mandatory
+# pcs constraint order stop ha_vip then stop ha_pool
+#
+# The stop ordering is critical for sharenfs: the VIP must be DOWN before
+# the pool stops, so NFS clients see a connection drop (silently retried by
+# hard mounts) instead of ESTALE errors from the export vanishing while the
+# VIP still answers.
+#
+# --- stickiness: avoid failback flapping ---
+# pcs resource defaults update resource-stickiness=200
+#
+# --- two-node cluster: do NOT auto-failback; require fencing to succeed ---
+# pcs property set stonith-enabled=true        # after fencing is configured!
+# pcs property set no-quorum-policy=stop       # stop resources if quorum lost

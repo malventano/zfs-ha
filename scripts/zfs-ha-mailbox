@@ -1,0 +1,209 @@
+#!/bin/sh
+# zfs-ha: SAS mailbox - a second confirmation path about peer host status.
+#
+# CONCEPT (user direction 2026-10-10): a dedicated SAS disk (dual-port, no STP
+# affiliation) visible to BOTH hosts acts as a "mailbox". Each host writes a
+# heartbeat record to its own slot; each host reads the peer's slot. A peer
+# that stops refreshing its slot is presumed dead-or-wedged - CORROBORATING
+# evidence, never sole proof.
+#
+# ROBUSTNESS RULE (user direction): the mailbox is NEVER a sole dependency.
+# It is a single disk = a single point of failure. It is one signal among:
+#   - corosync link state (primary signal)
+#   - carrier state per link
+#   - mailbox freshness (this file)
+#   - peer storage activity (affiliations / I/O probes)
+#   - BMC/PiKVM power readback (the only death proof)
+# A decision may only be made when MULTIPLE signals agree; see
+# zfs-ha-amialone (the gate).
+#
+# Failure modes of the mailbox itself (must be detected and reported):
+#   - disk absent from OS (quiesced/failed)  -> mailbox=UNAVAILABLE
+#   - disk present but I/O errors            -> mailbox=DEGRADED
+#   - peer slot stale                        -> PEER_MAILBOX_STALE (signal only)
+#
+# Layout on the mailbox disk (single partition, raw block writes):
+#   sector 0:     superblock (magic, format version, disk GUID)
+#   sector 1-2:   host A slot (seq, timestamp, state, checksum)
+#   sector 3-4:   host B slot
+#   sector 5-6:   epoch/fencing journal (append-only fence events)
+#
+# Usage:
+#   zfs-ha-mailbox init <by-id> <nodeA-name> <nodeB-name>
+#   zfs-ha-mailbox beat                     # write our slot (call every 2-5s)
+#   zfs-ha-mailbox read                     # dump both slots
+#   zfs-ha-mailbox peer-age                 # seconds since peer's last beat
+#   zfs-ha-mailbox status                   # UNAVAILABLE|DEGRADED|OK + peer age
+set -u
+
+MAILBOX_BYID="${MAILBOX_BYID:-}"
+CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
+SECTOR=512
+MAGIC="ZFSHAMBO"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+resolve() {
+    if [ -n "$MAILBOX_BYID" ]; then
+        echo "$MAILBOX_BYID"
+        return 0
+    fi
+    mb=$(grep -E '^mailbox=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)
+    [ -n "$mb" ] || die "no mailbox configured (pool.conf mailbox= or MAILBOX_BYID)"
+    echo "$mb"
+}
+
+dev() {
+    local byid
+    byid=$(resolve) || exit 1
+    local node
+    node=$(readlink -f "$byid" 2>/dev/null)
+    [ -n "$node" ] && [ -e "$node" ] || { echo "UNAVAILABLE" >&2; exit 3; }
+    echo "$node"
+}
+
+slot_offset() {
+    # $1 = slot number (1=A, 2=B); each slot is 2 sectors
+    echo $((1 + ($1 - 1) * 2))
+}
+
+write_slot() {
+    local node="$1" slot="$2" state="$3"
+    local seq ts
+    seq=$(cat /run/zfs-ha/mailbox.seq 2>/dev/null || echo 0)
+    seq=$((seq + 1))
+    mkdir -p /run/zfs-ha && echo "$seq" > /run/zfs-ha/mailbox.seq
+    ts=$(date +%s)
+    local off
+    off=$(slot_offset "$slot")
+    # record: magic(8) seq(8) ts(8) state(16) cksum(8) - packed into 512 bytes
+    printf '%.8s%08d%010d%-16.16s' "$MAGIC" "$seq" "$ts" "$state" > /tmp/mb.rec
+    cksum=$(cksum < /tmp/mb.rec | awk '{print $1}')
+    printf '%.8s%08d%010d%-16.16s%010d' "$MAGIC" "$seq" "$ts" "$state" "$cksum" > /tmp/mb.rec
+    dd if=/tmp/mb.rec of="$node" bs=$SECTOR count=1 seek="$off" conv=notrunc 2>/dev/null \
+        || { echo "beat: write failed" >&2; exit 3; }
+    rm -f /tmp/mb.rec
+}
+
+read_slot() {
+    local node="$1" slot="$2"
+    local off
+    off=$(slot_offset "$slot")
+    dd if="$node" bs=$SECTOR count=1 skip="$off" 2>/dev/null | head -c 52
+}
+
+parse_slot() {
+    # prints: seq ts state cksum_ok
+    # record layout: magic(1-8) seq(9-16) ts(17-26) state(27-42) cksum(43-52)
+    local raw="$1"
+    local magic seq ts state cksum
+    magic=$(printf '%.8s' "$raw")
+    seq=$(printf '%.8s' "${raw#????????}")
+    ts=$(printf '%.10s' "${raw#??????????????????}")
+    state=$(printf '%.16s' "${raw#??????????????????????????}" | tr -d ' ')
+    cksum=$(printf '%.10s' "${raw#??????????????????????????????????????????}")
+    if [ "$magic" != "$MAGIC" ]; then
+        echo "0 0 EMPTY 0"
+        return
+    fi
+    # verify checksum
+    printf '%-8s%08d%010d%-16s' "$MAGIC" "$seq" "$ts" "$state" > /tmp/mb.v
+    want=$(cksum < /tmp/mb.v | awk '{print $1}')
+    rm -f /tmp/mb.v
+    if [ "$want" = "$cksum" ]; then
+        echo "$seq $ts $state 1"
+    else
+        echo "$seq $ts $state 0"
+    fi
+}
+
+my_slot() {
+    # slot 1 = this host if its name sorts before the peer's, else 2
+    local me peer
+    me=$(hostname)
+    peer=$(grep -E '^peer=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)
+    [ -n "$peer" ] || die "no peer= in $CONF"
+    if [ "$me" \< "$peer" ]; then echo 1; else echo 2; fi
+}
+
+peer_slot() {
+    if [ "$(my_slot)" = "1" ]; then echo 2; else echo 1; fi
+}
+
+cmd_init() {
+    local byid="$1" nodeA="$2" nodeB="$3"
+    local node
+    node=$(readlink -f "$byid") || die "cannot resolve $byid"
+    [ -b "$node" ] || die "$byid is not a block device"
+    # write superblock
+    printf '%.8s%08d%010d%-16.16s%010d' "$MAGIC" 1 1 "INIT" 0 > /tmp/mb.sb
+    dd if=/tmp/mb.sb of="$node" bs=$SECTOR count=1 seek=0 conv=notrunc 2>/dev/null
+    rm -f /tmp/mb.sb
+    # clear slots
+    dd if=/dev/zero of="$node" bs=$SECTOR count=4 seek=1 2>/dev/null
+    # record in pool.conf
+    if grep -qE '^mailbox=' "$CONF" 2>/dev/null; then
+        sed -i "s|^mailbox=.*|mailbox=$byid|" "$CONF"
+    else
+        echo "mailbox=$byid" >> "$CONF"
+    fi
+    grep -qE '^peer=' "$CONF" 2>/dev/null || echo "peer=$nodeB" >> "$CONF"
+    echo "mailbox initialized: $byid (A=$nodeA B=$nodeB)"
+}
+
+cmd_beat() {
+    local node
+    node=$(dev) || exit $?
+    write_slot "$node" "$(my_slot)" "ALIVE"
+    echo "beat: ok"
+}
+
+cmd_read() {
+    local node
+    node=$(dev) || exit $?
+    echo "mine:  $(parse_slot "$(read_slot "$node" "$(my_slot)")")"
+    echo "peer:  $(parse_slot "$(read_slot "$node" "$(peer_slot)")")"
+}
+
+cmd_peer_age() {
+    local node
+    node=$(dev) || exit $?
+    raw=$(read_slot "$node" "$(peer_slot)")
+    set -- $(parse_slot "$raw")
+    ts="$2"
+    [ "$ts" -gt 0 ] 2>/dev/null || { echo "-1"; exit 0; }
+    echo $(( $(date +%s) - ts ))
+}
+
+cmd_status() {
+    local node
+    node=$(dev) 2>/dev/null || { echo "mailbox=UNAVAILABLE"; exit 3; }
+    raw=$(read_slot "$node" "$(peer_slot)")
+    set -- $(parse_slot "$raw")
+    ck_ok="$4"
+    age=$(cmd_peer_age 2>/dev/null || echo -1)
+    echo "mailbox=OK"
+    echo "peer_seq=$1"
+    echo "peer_age=$age"
+    echo "peer_cksum_ok=$ck_ok"
+    if [ "$ck_ok" != "1" ]; then
+        echo "peer_state=DEGRADED"
+    elif [ "$age" -lt 0 ]; then
+        echo "peer_state=EMPTY"
+    elif [ "$age" -gt 30 ]; then
+        echo "peer_state=STALE"
+    else
+        echo "peer_state=ALIVE"
+    fi
+}
+
+[ $# -ge 1 ] || { echo "usage: $0 {init|beat|read|peer-age|status} [args]" >&2; exit 2; }
+OP="$1"; shift
+case "$OP" in
+    init)     cmd_init "$@" ;;
+    beat)     cmd_beat "$@" ;;
+    read)     cmd_read "$@" ;;
+    peer-age) cmd_peer_age "$@" ;;
+    status)   cmd_status "$@" ;;
+    *) echo "unknown op: $OP" >&2; exit 2 ;;
+esac

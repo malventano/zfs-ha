@@ -1,0 +1,181 @@
+#!/bin/sh
+# zfs-ha strategy: sas - real SAS disks (dual-port, no STP affiliation).
+#
+# SAS disks support multiple initiator ports natively. There is no affiliation
+# dance; exclusivity comes from fencing evidence instead:
+#   - SBD watchdog (shared block on a mailbox disk)
+#   - SCSI persistent reservations (register+reserve; preempt on handoff)
+#   - verified BMC/PDU/PiKVM fence
+#
+# The shelf's accidental single-initiator protection is GONE with SAS: both
+# hosts can issue I/O concurrently. This strategy MUST be paired with fencing
+# (preflight in zfs-ha-poolconf / zfs-ha-config enforces it).
+#
+# Multipath: dual-port SAS disks appear as dm maps when multipathd is running.
+# quiesce/rescan are multipath-aware.
+set -u
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+is_multipath() {
+    command -v multipathd >/dev/null 2>&1 && multipath -l "$1" >/dev/null 2>&1
+}
+
+mp_map() {
+    multipath -l "$1" 2>/dev/null | head -1 | awk '{print $1}'
+}
+
+cmd_probe() {
+    local byid="$1"
+    local sd
+    sd=$(basename "$(readlink -f "$byid" 2>/dev/null)")
+    if [ -z "$sd" ]; then
+        echo "protocol=unknown"; echo "affiliation_enforced=unknown"
+        exit 0
+    fi
+    # SAS disk: SSP target port (not SATA tunnel)
+    local proto="sas"
+    if sg_inq "$byid" 2>/dev/null | grep -qi "ATA"; then
+        proto="sata"
+    fi
+    echo "protocol=$proto"
+    echo "affiliation_enforced=no"
+    if is_multipath "$byid"; then
+        echo "multipath=yes"
+        echo "mp_map=$(mp_map "$byid")"
+    else
+        echo "multipath=no"
+    fi
+    echo "shared_block_capable=yes"
+}
+
+cmd_release() {
+    # Release transport access AND our reservation (fencing=pr). Order:
+    # export already happened at the RA layer; here we clear the PR so the
+    # peer's preempt-or-acquire sees an unreserved disk, then quiesce.
+    if command -v zfs-ha-pr >/dev/null 2>&1; then
+        zfs-ha-pr release "$byid" >/dev/null 2>&1 || \
+            echo "release: PR release failed (continuing)" >&2
+    fi
+    # No transport-level access to release beyond that. Exclusivity is
+    # enforced by the fencing layer (SBD/PR/fence). Release = quiesce.
+    cmd_quiesce "$@"
+}
+
+cmd_recover() {
+    local byid="$1"; shift
+    local fence_evidence=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fence-evidence) fence_evidence="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$fence_evidence" ] || {
+        die "refused: recover requires --fence-evidence" && exit 1; }
+    # SAS: nothing to recover at the transport; just ensure OS visibility
+    cmd_rescan "$byid"
+}
+
+cmd_acquire() {
+    local byid="$1"; shift
+    # Exclusivity evidence sources (any one):
+    local fence_evidence=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fence-evidence) fence_evidence="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [ -n "$fence_evidence" ]; then
+        echo "evidence=fence-verified $fence_evidence"
+        exit 0
+    fi
+    # SCSI persistent reservation held by us? (fencing=pr - the SAS best
+    # practice path; zfs-ha-pr does the key management and parsing)
+    if command -v zfs-ha-pr >/dev/null 2>&1; then
+        if zfs-ha-pr held "$byid" 2>/dev/null; then
+            echo "evidence=scsi-pr-held $byid"
+            exit 0
+        fi
+    elif command -v sg_persist >/dev/null 2>&1; then
+        # legacy path: crude registered-key check
+        if sg_persist -r -d "$byid" 2>/dev/null | grep -qE "0x[0-9a-f]+ .*registered"; then
+            echo "evidence=scsi-pr-held $byid"
+            exit 0
+        fi
+    fi
+    # SBD watchdog active?
+    if [ -e /proc/sys/kernel/watchdog ] && pgrep -x sbd >/dev/null 2>&1; then
+        echo "evidence=sbd-watchdog active"
+        exit 0
+    fi
+    echo "acquire refused: no exclusivity evidence (fencing/PR/SBD) for $byid" >&2
+    exit 1
+}
+
+cmd_quiesce() {
+    local byid="$1"
+    if is_multipath "$byid"; then
+        local map
+        map=$(mp_map "$byid")
+        [ -n "$map" ] || { echo "quiesce: no dm map for $byid" >&2; exit 1; }
+        multipath -f "$map" >/dev/null 2>&1 || {
+            echo "quiesce: multipath -f $map failed" >&2; exit 1; }
+        echo "quiesced (multipath map removed): $byid ($map)"
+    else
+        local sd
+        sd=$(basename "$(readlink -f "$byid" 2>/dev/null)")
+        [ -n "$sd" ] || { echo "quiesce: cannot resolve" >&2; exit 1; }
+        if [ -e "/sys/block/$sd/device/delete" ]; then
+            echo 1 > "/sys/block/$sd/device/delete" || { echo "quiesce: delete failed" >&2; exit 1; }
+            echo "quiesced: $byid ($sd)"
+        else
+            echo "quiesced (already absent): $byid"
+        fi
+    fi
+}
+
+cmd_rescan() {
+    local byid="$1"
+    if command -v multipathd >/dev/null 2>&1; then
+        multipathd reconfigure >/dev/null 2>&1 || true
+    fi
+    local host="" h
+    for h in /sys/class/sas_host/*; do
+        host=$(basename "$h")
+        [ -e "/dev/bsg/expander-${host#host}:"* ] && break
+        host=""
+    done
+    [ -n "$host" ] && echo "- - -" > "/sys/class/scsi_host/$host/scan" 2>/dev/null
+    udevadm settle --timeout=30 2>/dev/null
+    if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
+        echo "rescanned: $byid present"
+        exit 0
+    fi
+    echo "rescan: $byid did not reappear" >&2
+    exit 1
+}
+
+cmd_verify() {
+    local byid="$1"
+    if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
+        echo "verify: $byid present in OS"
+        exit 0
+    fi
+    echo "verify: $byid absent (quiesced)"
+    exit 1
+}
+
+[ $# -ge 1 ] || { echo "usage: $0 <op> <by-id> [args]" >&2; exit 2; }
+OP="$1"; shift
+case "$OP" in
+    probe)   cmd_probe "$@" ;;
+    release) cmd_release "$@" ;;
+    recover) cmd_recover "$@" ;;
+    acquire) cmd_acquire "$@" ;;
+    quiesce) cmd_quiesce "$@" ;;
+    rescan)  cmd_rescan "$@" ;;
+    verify)  cmd_verify "$@" ;;
+    *) echo "unknown op: $OP" >&2; exit 2 ;;
+esac

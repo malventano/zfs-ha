@@ -1,0 +1,174 @@
+#!/bin/sh
+# zfs-ha: SCSI persistent reservation management (fencing=pr).
+#
+# SAS best practice for shared-access disks: each host REGISTERS a unique
+# 64-bit key with the disk, and the current owner holds a RESERVATION.
+# Non-owners can read (type 5) or do nothing (type 6) but every WRITE from
+# a non-registrant gets RESERVATION CONFLICT - the disk itself enforces
+# single-owner, independent of both OSes. This is the strongest fencing
+# primitive available on a dual-controller SAS shelf.
+#
+# Reservation type: 5 = Write Exclusive, Registrants Only (default).
+#   - reads allowed for all registrants, writes only for the holder
+#   - survives controller path failover (registrations are per-I_T nexus,
+#     both controller ports of a host register through their own paths)
+#   - type 6 (Exclusive Access, Registrants Only) blocks reads too; stricter
+#     but multipathd/udev probing on the peer will log conflicts. Use
+#     ZFS_HA_PR_TYPE=6 if you want total lockout.
+#
+# Key derivation: 0x5a17 + md5(hostname)[0:12] -> stable per-host 64-bit key.
+# The 0x5a17 prefix makes keys recognizable in `sg_persist -r` output.
+#
+# Usage:
+#   zfs-ha-pr key                     # print this host's key
+#   zfs-ha-pr status <by-id>          # who holds what (parseable)
+#   zfs-ha-pr register <by-id>        # idempotent: ensure we are registered
+#   zfs-ha-pr reserve <by-id>         # register + take the reservation
+#   zfs-ha-pr release <by-id>         # clear OUR reservation + de-register
+#   zfs-ha-pr preempt <by-id> <key>   # steal from a dead owner (fenced takeover)
+#   zfs-ha-pr held <by-id>            # rc=0 if WE hold the reservation
+set -u
+
+PR_TYPE="${ZFS_HA_PR_TYPE:-5}"
+  "5a17"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+have sg_persist || die "sg_persist not found (install sg3_utils)"
+
+mykey() {
+    # 0x5a17 prefix: recognizable in sg_persist -r output
+    printf '0x5a17%s' "$(printf '%s' "$(hostname)" | md5sum | cut -c1-12)"
+}
+
+# run sg_persist, tolerating the retry noise of a busy shelf
+pr() {
+    local try=0
+    while [ $try -lt 3 ]; do
+        sg_persist "$@" 2>/dev/null && return 0
+        try=$((try + 1))
+        sleep 1
+    done
+    return 1
+}
+
+cmd_key() { mykey; }
+
+cmd_status() {
+    local byid="$1"
+    [ -n "$byid" ] || die "usage: zfs-ha-pr status <by-id>"
+    local out
+    out=$(sg_persist -n -r -d "$byid" 2>/dev/null) || die "no PR data from $byid"
+    echo "$out" | grep -E 'Key=0x' | sed 's/^ *//' | while read -r k; do
+        if [ "$(echo "$k" | cut -d= -f2)" = "$(mykey)" ]; then
+            echo "$k (us)"
+        else
+            echo "$k"
+        fi
+    done
+    echo "$out" | grep -E 'Reservation follows|NO reservation' | sed 's/^ *//'
+}
+
+cmd_register() {
+    local byid="$1"
+    [ -n "$byid" ] || die "usage: zfs-ha-pr register <by-id>"
+    # already registered? (sg_persist -k lists our key)
+    if sg_persist -n -k -d "$byid" 2>/dev/null | grep -q "$(mykey)"; then
+        echo "registered: $(mykey) already on $byid"
+        return 0
+    fi
+    # SHELF QUIRK: register-over-existing-key fails with conflict on this
+    # shelf; register from key 0 works. If any key exists that is not ours,
+    # register with --param-sark=<that key>; if that fails, caller (reserve)
+    # falls back to clear.
+    local other
+    other=$(sg_persist -n -k -d "$byid" 2>/dev/null | grep -oE '0x[0-9a-f]+' | head -1)
+    if [ -n "$other" ]; then
+        pr -n -o --register --param-rk="$(mykey)" --param-sark="$other" -d "$byid" \
+            || die "register (replace $other) failed on $byid"
+    else
+        pr -n -o --register --param-rk=0x0 --param-sark="$(mykey)" -d "$byid" \
+            || die "register failed on $byid"
+    fi
+    echo "registered: $(mykey) on $byid"
+}
+
+cmd_reserve() {
+    local byid="$1"
+    [ -n "$byid" ] || die "usage: zfs-ha-pr reserve <by-id>"
+    if cmd_held "$byid" 2>/dev/null; then
+        echo "reserved: $(mykey) already holds $byid"
+        return 0
+    fi
+    cmd_register "$byid"
+    # SHELF QUIRK (DS460C + SATA interposers, observed 2026-10-17): a PR
+    # Register with --param-sark fails with reservation conflict while any
+    # reservation exists, and re-register over an existing key fails the
+    # same way. The reliable sequence is: clear (removes ALL registrations
+    # + reservation) -> register from key 0 -> reserve. Safe here because
+    # reserve only runs on the acquiring host AFTER the owner released
+    # (or was fenced) - a live peer's registration being cleared is exactly
+    # what the fencing evidence authorizes.
+    if ! pr -n -o --reserve --prout-type="$PR_TYPE" --param-rk="$(mykey)" -d "$byid"; then
+        echo "reserve: direct reserve failed - trying clear+register+reserve" >&2
+        pr -n -o --clear --param-rk="$(mykey)" -d "$byid" \
+            || echo "clear failed (no registrations?)" >&2
+        pr -n -o --register --param-rk=0x0 --param-sark="$(mykey)" -d "$byid" \
+            || die "register (from 0) failed on $byid"
+        pr -n -o --reserve --prout-type="$PR_TYPE" --param-rk="$(mykey)" -d "$byid" \
+            || die "reserve (after clear) failed on $byid"
+    fi
+    echo "reserved: $(mykey) holds $byid (type $PR_TYPE)"
+}
+
+cmd_release() {
+    local byid="$1"
+    [ -n "$byid" ] || die "usage: zfs-ha-pr release <by-id>"
+    # clear our reservation (no-op if we hold none), then de-register.
+    # SHELF QUIRK: de-register (register with rk=0) fails with conflict
+    # while ANY reservation exists on this shelf - so release the
+    # reservation first and tolerate de-register failure (a stale
+    # registration is harmless; the peer's reserve does clear+register).
+    pr -n -o --release --prout-type="$PR_TYPE" --param-rk="$(mykey)" -d "$byid" \
+        || echo "release: no reservation held (ok)" >&2
+    pr -n -o --register --param-rk=0x0 --param-sark="$(mykey)" -d "$byid" \
+        || echo "de-register failed (shelf quirk; stale registration ok)" >&2
+    echo "released: $byid"
+}
+
+cmd_preempt() {
+    local byid="$1" victim="$2"
+    [ -n "$byid" ] && [ -n "$victim" ] || die "usage: zfs-ha-pr preempt <by-id> <victim-key>"
+    # PREEMPT AND ABORT: removes the victim's registration and reservation
+    # and aborts its outstanding tasks. This is the FENCED takeover path -
+    # only legal after the victim host is provably dead (fence evidence).
+    cmd_register "$byid"
+    pr -n -o --preempt-abort --prout-type="$PR_TYPE" --param-rk="$(mykey)" \
+        --param-sark="$victim" -d "$byid" || die "preempt failed on $byid"
+    pr -n -o --reserve --prout-type="$PR_TYPE" --param-rk="$(mykey)" -d "$byid" \
+        || die "reserve-after-preempt failed on $byid"
+    echo "preempted: $victim removed, $(mykey) now holds $byid"
+}
+
+cmd_held() {
+    local byid="$1"
+    [ -n "$byid" ] || die "usage: zfs-ha-pr held <by-id>"
+    sg_persist -n -r -d "$byid" 2>/dev/null | grep -q "Key=$(mykey)" || return 1
+    sg_persist -n -r -d "$byid" 2>/dev/null | grep -q "Reservation follows" || return 1
+    # both true: a reservation exists AND our key is registered. Confirm the
+    # holder is us by checking the reservation key line matches our key.
+    sg_persist -n -r -d "$byid" 2>/dev/null | grep -A1 "Reservation follows" \
+        | grep -q "Key=$(mykey)"
+}
+
+case "${1:-}" in
+    key)     cmd_key ;;
+    status)  shift; cmd_status "$@" ;;
+    register) shift; cmd_register "$@" ;;
+    reserve) shift; cmd_reserve "$@" ;;
+    release) shift; cmd_release "$@" ;;
+    preempt) shift; cmd_preempt "$@" ;;
+    held)    shift; cmd_held "$@" ;;
+    *) echo "usage: zfs-ha-pr {key|status|register|reserve|release|preempt|held} <by-id> [key]" >&2; exit 2 ;;
+esac
