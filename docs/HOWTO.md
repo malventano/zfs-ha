@@ -757,6 +757,67 @@ With three votes you can drop `two_node` semantics, but keep fencing:
 quorum decides *who may run*, fencing decides *who is safe to run*. They
 are different questions and you need both answered.
 
+### 13.1 The two-node stall, and the way out (`zfs-ha-recover`)
+
+A two-node cluster has a failure mode you will eventually meet: **both
+hosts are up, the network is fine, but the cluster never formed (or lost
+quorum) - so the VIP is down and the pool is nowhere imported.** Neither
+node is allowed to start resources, because without quorum pacemaker must
+assume the other node might be running them. That refusal is correct. But
+it leaves you with a silent outage and, historically, no hint what to do.
+
+`zfs-ha-recover` is the supported way out. It never imports the pool
+behind pacemaker's back - every safety gate stays in the path.
+
+```sh
+zfs-ha-recover status        # diagnose only - changes nothing
+zfs-ha-recover run           # diagnose, then (if safe) unblock + start
+zfs-ha-recover run --force   # proceed past the warnings
+```
+
+What `status` tells you, and what it means:
+
+- **Quorate, resources down** - not a quorum problem. Check
+  `pcs status --full` and `journalctl -u pacemaker` (failed start, role
+  arbitration, manual stop).
+- **Not quorate, witness configured** - the witness or the network to it
+  is broken, *not* the peer. The peer may still be serving the pool with
+  quorum. The tool **refuses to proceed** and tells you to fix the
+  witness first. This is the case where forcing resources could
+  split-brain, and the tool is designed to get in your way.
+- **Not quorate, no witness, peer reachable but not serving** - the
+  classic 2-node stall. `run` unblocks via the pacemaker-supported knobs
+  (`wait_for_all=0`, then `no-quorum-policy=ignore` if needed), starts
+  the resources, and **restores the safety policy afterwards**.
+- **Not quorate, no witness, peer unreachable** - if the peer is really
+  down this is safe; if it's a network partition it is not. Verify the
+  peer is actually off (BMC/PDU readback) before `--force`.
+
+The dmesg hint: when the pool is down and quorum is absent, the resource
+agent's monitor emits this to the kernel log (rate-limited to once per
+10 minutes):
+
+```
+zfs-ha: cluster resources are DOWN (no quorum or cluster not formed).
+zfs-ha: to attempt manual bring-up, run:  sudo zfs-ha-recover status   (then: sudo zfs-ha-recover run)
+zfs-ha: if a quorum witness (qdevice) is configured, fix the witness/network instead -
+zfs-ha: forcing resources without quorum can split-brain the cluster.
+```
+
+So the operator who finds a dead array at 3am sees the fix in `dmesg`
+without needing to know this repo exists.
+
+> [!NOTE]
+> **Why the witness case refuses.** With a witness, "no quorum" has a
+> different meaning than in a plain 2-node cluster: it usually means the
+> *witness* is down, and the peer may still hold quorum and be serving
+> the pool. Unblocking your side then creates exactly the dual-owner
+> situation every other mechanism here exists to prevent. The tool
+> warns loudly and requires you to have verified the peer is not serving
+> before you `--force` past it. This is the 2-node special case done
+> intelligently: same tool, different guardrails depending on whether a
+> witness is configured.
+
 ## 14. Operations
 
 - **Planned maintenance**: `pcs resource move ha_pool` (or `standby` the

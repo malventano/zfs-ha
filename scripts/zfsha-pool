@@ -346,6 +346,22 @@ def action_stop(env):
 def action_monitor(env):
     pool, disks = validate(env)
     if not pool_imported(pool):
+        # Pool not running. If quorum is also absent, emit a dmesg hint so an
+        # operator staring at a console knows there is a supported way out
+        # (2-node stall: both hosts online, neither allowed to start
+        # resources). Rate-limited to once per 10 minutes per host.
+        try:
+            stamp = "/run/zfs-ha/.recover-hint"
+            now = time.time()
+            last = 0
+            if os.path.exists(stamp):
+                last = os.path.getmtime(stamp)
+            if now - last > 600:
+                os.makedirs("/run/zfs-ha", exist_ok=True)
+                open(stamp, "w").write(str(now))
+                run(["/usr/lib/zfs-ha/zfs-ha-recover", "dmesg-hint"], timeout=10)
+        except Exception:
+            pass
         ocf_exit(OCF_NOT_RUNNING)
     health = pool_health(pool)
     if health == "SUSPENDED":

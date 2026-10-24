@@ -1,0 +1,222 @@
+#!/bin/sh
+# zfs-ha: manual cluster recovery ("bring up the array when nothing came up").
+#
+# THE PROBLEM (user direction 2026-10-24): on a 2-node cluster, if both hosts
+# are booted but the cluster never formed (or lost quorum), the VIP and the
+# pool are down from EVERYONE's vantage point - both hosts are online, the
+# array is idle, and no automatic mechanism will ever start it. Pacemaker
+# correctly refuses: without quorum it must not run resources, because the
+# other node might be running them too. That is the right default. But it
+# leaves the operator with a silent outage and no hint what to do.
+#
+# THE ANSWER: an explicit, operator-invoked recovery command that:
+#   1. reports exactly why the cluster is not running resources
+#   2. checks for a quorum witness (qdevice/qnetd) and WARNS if one is
+#      configured but not visible - with a witness, quorum loss means the
+#      witness or the network is broken, and forcing resources could
+#      split-brain against a node that still has quorum
+#   3. if the operator proceeds, does it the PACEMAKER-SUPPORTED way:
+#      quorum "unblock" (corosync expects-votes reduction) - never by
+#      importing the pool behind pacemaker's back
+#   4. emits a dmesg message pointing operators at this command
+#
+# Usage:
+#   zfs-ha-recover status        # diagnose only - no changes
+#   zfs-ha-recover run           # diagnose + (if safe) unblock + start
+#   zfs-ha-recover dmesg-hint    # emit the dmesg hint (called by the monitor)
+#
+# Exit codes: 0 = resources running (or already were), 1 = refused (see
+# output for why), 2 = usage/config error.
+set -u
+
+CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
+FORCE=0
+
+note() { echo "  $*"; }
+warn() { echo "  WARN: $*"; }
+die()  { echo "  ERROR: $*" >&2; exit 1; }
+
+get_conf() { grep -E "^$1=" "$CONF" 2>/dev/null | head -1 | cut -d= -f2-; }
+POOL=$(get_conf pool)
+PEER=$(get_conf peer)
+
+# --- dmesg hint ------------------------------------------------------------
+# Emitted periodically by the RA monitor when the pool is not running and
+# quorum is absent, so an operator looking at dmesg/console sees the fix.
+dmesg_hint() {
+    echo "zfs-ha: cluster resources are DOWN (no quorum or cluster not formed)." > /dev/kmsg 2>/dev/null
+    echo "zfs-ha: to attempt manual bring-up, run:  sudo zfs-ha-recover status   (then: sudo zfs-ha-recover run)" > /dev/kmsg 2>/dev/null
+    echo "zfs-ha: if a quorum witness (qdevice) is configured, fix the witness/network instead -" > /dev/kmsg 2>/dev/null
+    echo "zfs-ha: forcing resources without quorum can split-brain the cluster." > /dev/kmsg 2>/dev/null
+    return 0
+}
+
+# --- diagnostics -----------------------------------------------------------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+quorum_info() {
+    # prints: quorate=yes|no|unknown qdevice=yes|no
+    local quorate="unknown" qdev="no"
+    if have corosync-quorumtool; then
+        corosync-quorumtool -s 2>/dev/null | grep -qi "^Quorate:.*Yes" && quorate=yes || quorate=no
+    fi
+    # witness detection: qdevice configured in corosync.conf or running
+    if grep -qE "quorum.*device.*model|qdevice" /etc/corosync/corosync.conf 2>/dev/null \
+       || pcs qdevice status net 2>/dev/null | grep -q . \
+       || systemctl is-active corosync-qnetd >/dev/null 2>&1; then
+        qdev=yes
+    fi
+    echo "$quorate $qdev"
+}
+
+peer_reachable() {
+    [ -n "$PEER" ] && ping -c 1 -W 2 "$PEER" >/dev/null 2>&1
+}
+
+peer_pool_running() {
+    # does the PEER have the pool imported / the resource started?
+    have pcs || return 1
+    pcs status 2>/dev/null | grep -qE "ha_pool.*Started.*($PEER|$(hostname))"
+}
+
+pool_imported_here() {
+    [ -n "$POOL" ] && zpool list -H -o name "$POOL" >/dev/null 2>&1
+}
+
+resources_running() {
+    have pcs || return 1
+    pcs status 2>/dev/null | grep -qE "ha_pool.*Started"
+}
+
+# --- diagnosis -------------------------------------------------------------
+
+diagnose() {
+    local qinfo quorate qdev
+    qinfo=$(quorum_info)
+    quorate=${qinfo%% *}
+    qdev=${qinfo##* }
+
+    echo "== zfs-ha-recover: cluster diagnosis =="
+    note "pool:        ${POOL:-<unset>} (imported here: $(pool_imported_here && echo yes || echo no))"
+    note "peer:        ${PEER:-<unset>} (reachable: $(peer_reachable && echo yes || echo no))"
+    note "quorum:      quorate=$quorate  witness-configured=$qdev"
+
+    if resources_running; then
+        note "resources:   RUNNING - nothing to do"
+        return 0
+    fi
+    note "resources:   DOWN"
+
+    if [ "$quorate" = "yes" ]; then
+        note "quorum is healthy; the resource is stopped for another reason"
+        note "(failed start, role arbitration, or manual stop). Check:"
+        note "  pcs status --full; journalctl -u pacemaker -n 50"
+        return 1
+    fi
+
+    if [ "$qdev" = "yes" ]; then
+        warn "A QUORUM WITNESS (qdevice/qnetd) is configured but quorum is LOST."
+        warn "With a witness, losing quorum means the witness or the network to it"
+        warn "is down - NOT that the peer is down. The peer may still be serving"
+        warn "the pool with quorum. FORCING RESOURCES HERE COULD SPLIT-BRAIN."
+        warn "Fix the witness or the network path to it first:"
+        warn "  pcs qdevice status; systemctl status corosync-qnetd; ping <witness-host>"
+        warn "Only proceed with 'zfs-ha-recover run' if you have VERIFIED the peer"
+        warn "is not running the pool (peer unreachable AND peer storage idle)."
+        return 1
+    fi
+
+    # no witness configured - the plain 2-node case
+    if peer_reachable; then
+        if peer_pool_running; then
+            note "peer is reachable and appears to be running the pool -"
+            note "nothing to do here; the service is up on the peer."
+        else
+            note "peer is reachable but not running the pool, and this node is"
+            note "not quorate. This is the classic 2-node stall: both nodes"
+            note "online, neither allowed to start resources."
+            note "Run 'zfs-ha-recover run' to unblock (reduces expected votes"
+            note "via pacemaker's supported quorum mechanism)."
+        fi
+    else
+        note "peer is UNREACHABLE and this node is not quorate."
+        note "If the peer is actually down, unblocking here is safe and is"
+        note "what you want. If the peer is up but the network is partitioned,"
+        note "unblocking here risks split-brain - verify the peer is off"
+        note "(BMC/PDU power readback) before proceeding."
+    fi
+    return 1
+}
+
+# --- the supported unblock --------------------------------------------------
+
+unblock() {
+    # Pacemaker-supported ways to run resources without quorum, in order of
+    # preference. We do NOT import the pool directly - that would bypass
+    # every safety gate the RA provides.
+    #
+    # 1. two_node + wait_for_all is the usual stall. Dropping wait_for_all
+    #    lets the 2-node cluster form quorum with just itself (this is the
+    #    documented pcs knob for exactly this situation).
+    # 2. Otherwise, no-quorum-policy=ignore lets pacemaker run resources
+    #    without quorum (operator-acknowledged split-brain risk).
+    if pcs quorum status 2>/dev/null | grep -q "WaitForAll"; then
+        note "unblocking: removing wait_for_all (2-node quorum can form with one node)"
+        pcs quorum update wait_for_all=0 >/dev/null 2>&1 || return 1
+        sleep 5
+        if resources_running; then return 0; fi
+    fi
+    note "unblocking: no-quorum-policy=ignore (resources may run without quorum)"
+    pcs property set no-quorum-policy=ignore >/dev/null 2>&1 || return 1
+    sleep 5
+    resources_running
+}
+
+restore_policy() {
+    # put the safety policy back once resources are running
+    pcs property set no-quorum-policy=stop >/dev/null 2>&1 || true
+    if grep -q "two_node" /etc/corosync/corosync.conf 2>/dev/null; then
+        pcs quorum update wait_for_all=1 >/dev/null 2>&1 || true
+    fi
+    note "safety policy restored (no-quorum-policy=stop, wait_for_all=1)"
+}
+
+cmd_run() {
+    diagnose
+    local rc=$?
+    if [ "$rc" -eq 0 ]; then
+        return 0
+    fi
+    if [ "$FORCE" != "1" ]; then
+        echo
+        echo "Re-run with --force to proceed:  zfs-ha-recover run --force"
+        echo "(read the warnings above first - especially the witness case)"
+        return 1
+    fi
+    echo
+    note "proceeding with pacemaker-supported unblock..."
+    if unblock; then
+        note "resources are RUNNING"
+        restore_policy
+        return 0
+    fi
+    # unblock alone was not enough - ask pacemaker to start the resources
+    note "unblock applied but resources not started; requesting start via pcs"
+    pcs resource enable ha_pool >/dev/null 2>&1 || true
+    pcs resource cleanup ha_pool >/dev/null 2>&1 || true
+    sleep 10
+    if resources_running; then
+        note "resources are RUNNING"
+        restore_policy
+        return 0
+    fi
+    die "resources still not running - check: pcs status --full; journalctl -u pacemaker -n 50"
+}
+
+case "${1:-}" in
+    status)     diagnose ;;
+    run)        shift; [ "${1:-}" = "--force" ] && FORCE=1; cmd_run ;;
+    dmesg-hint) dmesg_hint ;;
+    *)          echo "usage: $0 {status|run [--force]|dmesg-hint}" >&2; exit 2 ;;
+esac

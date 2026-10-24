@@ -87,6 +87,8 @@ scripts/
   zfs-ha-role           boot-time role arbitration (primary/secondary)
   zfs-ha-mailbox        SAS-disk heartbeat (second confirmation path)
   zfs-ha-amialone       fence-or-abstain gate (never imports)
+  zfs-ha-recover        manual 2-node stall recovery (quorum-aware,
+                        refuses when a witness is configured)
   zfs-ha-pr             SCSI persistent reservation fencing (register/
                         reserve/release/preempt)
   zfs-ha-cutover        controlled cutover protocol (no-transport-release
