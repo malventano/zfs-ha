@@ -235,6 +235,43 @@ cmd_quiesce() {
 
 cmd_rescan() {
     local byid="$1"
+    # CRITICAL: hold the allow-import flag for the ENTIRE rediscovery
+    # sequence. The udev quiesce rule deletes HA devices the instant they
+    # appear; mpt3sas rediscovery after a phy/host reset takes 10-30s and
+    # device nodes appear one at a time during that window. Without the
+    # flag held here, every device that appears mid-sequence is deleted
+    # before the next step can see it (observed live 2026-10-24: the RA set
+    # the flag, but the rescan op ran long enough that devices re-attached
+    # after the RA's window and were deleted). Reference-counted so nested
+    # or parallel rescans don't remove the flag early; if the RA already
+    # set the flag, the RA owns its lifecycle and we leave it alone.
+    local ALLOW_FLAG="/run/zfs-ha/allow-import"
+    local REFCNT="/run/zfs-ha/.rescan-refcount"
+    local had_flag=0
+    mkdir -p /run/zfs-ha
+    if [ -f "$ALLOW_FLAG" ]; then
+        had_flag=1
+    else
+        echo zfs-ha-rescan > "$ALLOW_FLAG" 2>/dev/null || true
+    fi
+    local n=0
+    [ -f "$REFCNT" ] && n=$(cat "$REFCNT" 2>/dev/null || echo 0)
+    echo $((n + 1)) > "$REFCNT"
+
+    release_flag() {
+        local m=0
+        [ -f "$REFCNT" ] && m=$(cat "$REFCNT" 2>/dev/null || echo 0)
+        m=$((m - 1))
+        if [ "$m" -le 0 ]; then
+            rm -f "$REFCNT"
+            if [ "$had_flag" = "0" ] && [ -f "$ALLOW_FLAG" ]; then
+                rm -f "$ALLOW_FLAG"
+            fi
+        else
+            echo "$m" > "$REFCNT"
+        fi
+    }
+
     # find the SAS host with expanders and scan it; also handle boot-time
     # affiliation-conflict drops via a host reset when a plain scan fails
     local host="" h e
@@ -245,11 +282,12 @@ cmd_rescan() {
         done
         host=""
     done
-    [ -n "$host" ] || { echo "rescan: no SAS host" >&2; exit 1; }
+    [ -n "$host" ] || { echo "rescan: no SAS host" >&2; release_flag; exit 1; }
     echo "- - -" > "/sys/class/scsi_host/$host/scan" 2>/dev/null
     udevadm settle --timeout=30 2>/dev/null
     if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
         echo "rescanned: $byid present"
+        release_flag
         exit 0
     fi
     # plain scan insufficient (transport dropped it) -> host reset.
@@ -272,8 +310,10 @@ cmd_rescan() {
     udevadm settle --timeout=30 2>/dev/null
     if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
         echo "rescanned (after host reset): $byid present"
+        release_flag
         exit 0
     fi
+    release_flag
     echo "rescan: $byid did not reappear" >&2
     exit 1
 }

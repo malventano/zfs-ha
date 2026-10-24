@@ -161,6 +161,41 @@ cmd_quiesce() {
 
 cmd_rescan() {
     local byid="$1"
+    # CRITICAL: hold the allow-import flag for the ENTIRE rediscovery
+    # sequence. The udev quiesce rule deletes HA devices the instant they
+    # appear; mpt3sas rediscovery after a scan/host reset takes 10-30s and
+    # device nodes appear one at a time during that window. Without the
+    # flag held here, every device that appears mid-sequence is deleted
+    # before the next step can see it (observed live 2026-10-24).
+    # Reference-counted; if the RA already set the flag, the RA owns its
+    # lifecycle and we leave it alone.
+    local ALLOW_FLAG="/run/zfs-ha/allow-import"
+    local REFCNT="/run/zfs-ha/.rescan-refcount"
+    local had_flag=0
+    mkdir -p /run/zfs-ha
+    if [ -f "$ALLOW_FLAG" ]; then
+        had_flag=1
+    else
+        echo zfs-ha-rescan > "$ALLOW_FLAG" 2>/dev/null || true
+    fi
+    local n=0
+    [ -f "$REFCNT" ] && n=$(cat "$REFCNT" 2>/dev/null || echo 0)
+    echo $((n + 1)) > "$REFCNT"
+
+    release_flag() {
+        local m=0
+        [ -f "$REFCNT" ] && m=$(cat "$REFCNT" 2>/dev/null || echo 0)
+        m=$((m - 1))
+        if [ "$m" -le 0 ]; then
+            rm -f "$REFCNT"
+            if [ "$had_flag" = "0" ] && [ -f "$ALLOW_FLAG" ]; then
+                rm -f "$ALLOW_FLAG"
+            fi
+        else
+            echo "$m" > "$REFCNT"
+        fi
+    }
+
     if command -v multipathd >/dev/null 2>&1; then
         multipathd reconfigure >/dev/null 2>&1 || true
     fi
@@ -176,8 +211,31 @@ cmd_rescan() {
     udevadm settle --timeout=30 2>/dev/null
     if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
         echo "rescanned: $byid present"
+        release_flag
         exit 0
     fi
+    # plain scan insufficient -> host reset (transport dropped the device)
+    local sgnode sgdev
+    for sgdev in /sys/class/scsi_generic/sg*; do
+        [ -e "$sgdev/device" ] || continue
+        if readlink -f "$sgdev/device" 2>/dev/null | grep -q "scsi_host/$host/"; then
+            sgnode="/dev/$(basename "$sgdev")"
+            break
+        fi
+    done
+    if [ -n "$sgnode" ]; then
+        sg_reset -H "$sgnode" >/dev/null 2>&1 || true
+    else
+        echo "rescan: cannot resolve sg node for $host; skipping host reset" >&2
+    fi
+    sleep 15
+    udevadm settle --timeout=30 2>/dev/null
+    if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then
+        echo "rescanned (after host reset): $byid present"
+        release_flag
+        exit 0
+    fi
+    release_flag
     echo "rescan: $byid did not reappear" >&2
     exit 1
 }

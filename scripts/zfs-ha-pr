@@ -146,6 +146,24 @@ cmd_preempt() {
     # PREEMPT AND ABORT: removes the victim's registration and reservation
     # and aborts its outstanding tasks. This is the FENCED takeover path -
     # only legal after the victim host is provably dead (fence evidence).
+    # SHELF QUIRK: register-over-existing-key fails with conflict (same as
+    # in reserve), so if we are not registered yet, preempt using the
+    # victim's own key as rk/sark - the SCSI-correct way to break a
+    # reservation we hold no registration for. Fall back to clear+register.
+    if ! sg_persist -n -k -d "$byid" 2>/dev/null | grep -q "$(mykey)"; then
+        if pr -n -o --preempt-abort --prout-type="$PR_TYPE" \
+               --param-rk="$victim" --param-sark="$victim" -d "$byid"; then
+            pr -n -o --register --param-rk=0x0 --param-sark="$(mykey)" -d "$byid" \
+                || die "register (after victim-key preempt) failed on $byid"
+            pr -n -o --reserve --prout-type="$PR_TYPE" --param-rk="$(mykey)" -d "$byid" \
+                || die "reserve (after victim-key preempt) failed on $byid"
+            echo "preempted (victim-key path): $victim removed, $(mykey) now holds $byid"
+            return 0
+        fi
+        echo "victim-key preempt failed - falling back to clear path" >&2
+        pr -n -o --clear --param-rk="$victim" -d "$byid" \
+            || echo "clear failed (continuing)" >&2
+    fi
     cmd_register "$byid"
     pr -n -o --preempt-abort --prout-type="$PR_TYPE" --param-rk="$(mykey)" \
         --param-sark="$victim" -d "$byid" || die "preempt failed on $byid"

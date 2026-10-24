@@ -61,8 +61,21 @@ peer_pacemaker_up() {
 
 peer_pool_up() {
     # does the peer have the pool imported?
-    pcs status 2>/dev/null | grep -E "ha_pool.*Started.*$PEER" >/dev/null 2>&1
-    return $?
+    # pcs status is NOT sufficient: it reports "Started <peer>" from the CIB
+    # even when the start actually failed (stale state after a crash/reboot
+    # cycle). Cross-check over SSH that the peer really has the pool
+    # imported. If the ssh cross-check fails, fall back to the pcs view.
+    if pcs status 2>/dev/null | grep -qE "ha_pool.*Started.*$PEER"; then
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
+            "zpool list -H -o name ${POOL:-__none__}" >/dev/null 2>&1; then
+            return 0
+        fi
+        # pcs says started but the peer does not have the pool imported:
+        # stale CIB state - treat as NOT up so the secondary can take over
+        log "pcs reports pool started on peer but peer has no pool imported (stale state)"
+        return 1
+    fi
+    return 1
 }
 
 peer_ping() {

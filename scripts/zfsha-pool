@@ -18,6 +18,7 @@ OCF parameters:
   import_opts - extra zpool import options
 """
 import os
+import glob
 import subprocess
 import sys
 import time
@@ -206,11 +207,97 @@ def action_start(env):
     # flag would let the udev rule delete them mid-sequence. The flag is
     # removed only on successful import (below) or by action_stop.
     # Rescan + acquire with retry policy (HA = retry, then degrade):
-    #   attempt 1-2: full rescan + acquire per disk
+    #   attempt 1: plain rescan + acquire per disk
+    #   attempt 2: phy hard reset (op=2) on any disk phy still affiliated to
+    #     the PEER's SAS address, then rescan again. mpt3sas drops disks at
+    #     boot when the peer holds their STP affiliations ("sata affiliation
+    #     conflict"); a plain scan cannot recover them - the stale
+    #     affiliation must be broken at the expander first (VALIDATION V10.3,
+    #     observed live 2026-10-24: this is what blocks every start after a
+    #     peer-side fence or a fast peer reboot).
+    #   attempt 3: host reset (sg_reset -H) to recreate the SCSI targets.
     #   if disks are still missing after retries: import DEGRADED with the
     #   disks that ARE present (raidz2 tolerates 2 missing; raidz1 tolerates 1).
     #   A missing disk is logged loudly - the pool runs degraded until the
     #   disk is replaced (zpool replace).
+    def peer_sas_address():
+        # the peer's HBA SAS address comes from pool.conf (peer_sas_addr=)
+        # or from the role/peer config; fall back to scanning for any
+        # affiliation held by an address that is not ours.
+        cfg = env.get("config") or "/etc/zfs-ha/pool.conf"
+        try:
+            with open(cfg) as f:
+                for line in f:
+                    if line.startswith("peer_sas_addr="):
+                        return line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+        return None
+
+    def our_sas_addresses():
+        addrs = set()
+        try:
+            for p in glob.glob("/sys/class/sas_host/*/device/*/*/sas_address"):
+                with open(p) as f:
+                    a = f.read().strip()
+                    if a and a != "0x0000000000000000":
+                        addrs.add(a)
+        except OSError:
+            pass
+        return addrs
+
+    def reset_peer_affiliated_phys():
+        """Hard-reset (op=2) every disk phy affiliated to the peer's HBA.
+
+        This breaks the stale STP affiliation that mpt3sas used as grounds
+        to drop the disk at boot. Safe: only phys holding the PEER's
+        address are touched - our own affiliations are left alone.
+        """
+        peer = peer_sas_address()
+        ours = our_sas_addresses()
+        bsgs = sorted(glob.glob("/dev/bsg/expander-*"))
+        if not bsgs:
+            return 0
+        # discover the peer's address from the expander if pool.conf lacks it:
+        # any affiliation not held by one of OUR addresses belongs to the peer
+        reset = 0
+        for bsg in bsgs:
+            out = run(["/usr/local/bin/smp_discover", bsg], timeout=30)
+            if out.returncode != 0:
+                continue
+            # attached disk phys on this expander
+            phys = []
+            for line in out.stdout.splitlines():
+                if "D:attached" in line and "t(SATA)" in line:
+                    try:
+                        phys.append(int(line.split("phy")[1].split(":")[0].strip()))
+                    except (IndexError, ValueError):
+                        continue
+            for phy in phys:
+                r = run(["/usr/local/bin/smp_rep_phy_sata", f"--phy={phy}", bsg],
+                        timeout=15)
+                if r.returncode != 0:
+                    continue
+                addr = None
+                valid = False
+                for line in r.stdout.splitlines():
+                    if "affiliation valid" in line:
+                        valid = "1" in line.split(":")[-1]
+                    if "affiliated STP initiator" in line:
+                        addr = line.split()[-1]
+                if not valid or not addr:
+                    continue
+                if addr in ours:
+                    continue  # ours - never touch
+                if peer and addr != peer:
+                    continue  # some third party - not ours to reset
+                run(["/usr/local/bin/smp_phy_control", f"--phy={phy}",
+                     "--op=2", bsg], timeout=15)
+                reset += 1
+                print(f"phy reset (stale peer affiliation): {bsg} phy{phy} "
+                      f"addr={addr}", file=sys.stderr)
+        return reset
+
     missing = []
     for attempt in range(1, 4):
         missing = []
@@ -231,8 +318,15 @@ def action_start(env):
         if attempt == 2 and missing:
             # devices still missing after 2 attempts: the mpt3sas transport
             # likely dropped them at boot (affiliation conflict) and a plain
-            # scan cannot recover them. Force a host reset to recreate the
-            # SCSI targets (MMP_ANALYSIS: sg_reset -H redoes full discovery).
+            # scan cannot recover them. First break the stale peer
+            # affiliations at the expander (phy hard reset), then force a
+            # host reset to recreate the SCSI targets (MMP_ANALYSIS:
+            # sg_reset -H redoes full discovery).
+            n = reset_peer_affiliated_phys()
+            if n:
+                print(f"reset {n} peer-affiliated phys; settling before "
+                      "host reset", file=sys.stderr)
+                time.sleep(10)
             # Resolve the SAS host's sg node dynamically - /dev/sg0 is often
             # the SES enclosure device, and resetting that would wedge the
             # enclosure session the SMP tools depend on.
