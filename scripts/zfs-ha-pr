@@ -81,8 +81,15 @@ cmd_register() {
     # shelf; register from key 0 works. If any key exists that is not ours,
     # register with --param-sark=<that key>; if that fails, caller (reserve)
     # falls back to clear.
+    # NOTE: the "PR generation=0xNN" line also matches a bare 0x... grep,
+    # so only keys listed under a "registered reservation key" header count.
+    # "PR generation=0xNN" also matches a bare 0x... grep, so require the
+    # key line to NOT be the generation line: keys print as bare "0x..." on
+    # their own line, the generation line contains "PR generation=".
     local other
-    other=$(sg_persist -n -k -d "$byid" 2>/dev/null | grep -oE '0x[0-9a-f]+' | head -1)
+    other=$(sg_persist -n -k -d "$byid" 2>/dev/null \
+        | grep -v 'PR generation' | grep -oE '0x[0-9a-f]+' \
+        | grep -v "$(mykey)" | head -1)
     if [ -n "$other" ]; then
         pr -n -o --register --param-rk="$(mykey)" --param-sark="$other" -d "$byid" \
             || die "register (replace $other) failed on $byid"

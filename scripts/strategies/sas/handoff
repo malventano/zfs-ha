@@ -60,7 +60,9 @@ cmd_release() {
     fi
     # No transport-level access to release beyond that. Exclusivity is
     # enforced by the fencing layer (SBD/PR/fence). Release = quiesce.
-    cmd_quiesce "$@"
+    # (re-assign: $1 was consumed by the shift above; under set -u the
+    # positional is gone, so pass the resolved byid explicitly)
+    cmd_quiesce "$byid"
 }
 
 cmd_recover() {
