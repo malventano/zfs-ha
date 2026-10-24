@@ -76,6 +76,45 @@ from the disks. Validated findings on the reference shelf:
 Treat any expander-isolation scheme as an experiment, never as the primary
 fencing method.
 
+## 6. fence_zfs_ha_stp - the shipped storage-isolation agent (experimental)
+
+This repo ships `fence_zfs_ha_stp` (installed by `make install`), a stonith
+agent that fences the peer **at the shelf level**: it hard-resets the phys
+currently affiliated to the peer's HBA SAS address and clears those
+affiliations, so the peer loses all access to the shared pool disks.
+
+Understand what it is and is not:
+
+- It is a **storage fence, not a power fence**. The peer OS keeps running -
+  it can still hold the VIP and serve cached data. Pair it with the VIP
+  teardown ordering and MMP (`multihost=on`), and prefer a real power fence
+  (BMC/PDU/PiKVM) when the hardware has one.
+- It only applies to the `stp` path (SATA disks with STP affiliations). The
+  `sas` path fences with SCSI persistent reservations instead (`zfs-ha-pr`).
+- **The `off` action has not yet been exercised in a live fence** on the
+  reference cluster (see VALIDATION.md V13) - it was configured as a stonith
+  resource but never fired against a real failure. Per the rule below, treat
+  it as untested until you have run the fence test yourself.
+
+Setup:
+
+```sh
+# find the peer's HBA SAS address (run on either node):
+sudo sas_topology        # or: cat /sys/class/sas_host/*/device/*/*/sas_address
+
+pcs stonith create fence_stp fence_zfs_ha_stp \
+    peer_sas=<peer-hba-sas-address> \
+    pcmk_host_list=<peer-node-name> op monitor interval=60s
+pcs property set stonith-enabled=true
+```
+
+Test it before trusting it (mandatory, per the rule below):
+
+```sh
+pcs stonith fence <peer-node-name>   # peer must lose disk access; verify
+                                     # with smp_rep_phy_sata from either node
+```
+
 ## Two-node specifics
 
 - `two_node: 1` in corosync quorum config (set automatically by

@@ -28,19 +28,21 @@ install: smp_send
 	install -Dm755 scripts/strategies/stp/handoff $(DESTDIR)$(HALIB)/strategies.d/stp/handoff
 	install -Dm755 scripts/strategies/sas/handoff $(DESTDIR)$(HALIB)/strategies.d/sas/handoff
 	install -Dm755 scripts/strategies/null/handoff $(DESTDIR)$(HALIB)/strategies.d/null/handoff
-	ln -sf $(HALIB)/zfs-ha-pr $(DESTDIR)$(PREFIX)/bin/zfs-ha-pr
-	ln -sf $(HALIB)/zfs-ha-cutover $(DESTDIR)$(PREFIX)/bin/zfs-ha-cutover
-	ln -sf $(HALIB)/zfs-ha-udevrule $(DESTDIR)$(PREFIX)/bin/zfs-ha-udevrule
+	# every tool gets a PATH-visible symlink in $(PREFIX)/bin
+	for t in zfs-ha-handoff zfs-ha-config zfs-ha-poolconf zfs-ha-quiesce \
+	         zfs-ha-doctor zfs-ha-mailbox zfs-ha-amialone zfs-ha-pr \
+	         zfs-ha-cutover zfs-ha-role zfs-ha-udevrule zfs-ha-udev-delete; do \
+	    ln -sf $(HALIB)/$$t $(DESTDIR)$(PREFIX)/bin/$$t; done
+	ln -sf $(HALIB)/fence_zfs_ha_stp $(DESTDIR)$(PREFIX)/bin/fence_zfs_ha_stp
 	install -m755 scripts/check_boot_import.sh $(DESTDIR)$(PREFIX)/bin/check_boot_import
-	install -m755 scripts/fence_zfs_ha_stp $(DESTDIR)$(HALIB)/fence_zfs_ha_stp
 	install -Dm755 scripts/zfsha-pool $(DESTDIR)$(OCFDIR)/zfsha/Pool
 	install -m755 utils/shelf-health.py $(DESTDIR)$(PREFIX)/bin/shelf-health
 	install -m755 utils/sas_topology.sh $(DESTDIR)$(PREFIX)/bin/sas_topology
-	@echo "installed: smp_send, handoff dispatcher + strategies, quiesce, doctor, role, mailbox, amialone, pr, cutover, udevrule + udev-delete, fence_zfs_ha_stp, check_boot_import, ocf:zfsha:Pool, shelf-health, sas_topology"
+	@echo "installed: smp_send, handoff dispatcher + strategies, quiesce, doctor, role, mailbox, amialone, pr, cutover, udevrule + udev-delete, fence_zfs_ha_stp, check_boot_import, ocf:zfsha:Pool, shelf-health, sas_topology (all on PATH via $(PREFIX)/bin)"
 
 check: smp_send
 	@echo "== topology check =="
-	@PATH=$(PREFIX)/bin:$$PATH sh scripts/sas_topology.sh | head -20
+	@PATH=$(PREFIX)/bin:$$PATH sh utils/sas_topology.sh | head -20
 	@echo "== affiliation read check =="
 	@for e in /dev/bsg/expander-*; do \
 		[ -e "$$e" ] || continue; \

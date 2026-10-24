@@ -5,12 +5,12 @@ anything, resets anything, or changes any state. They are the first thing I
 run when a disk "disappears" or a bay looks wrong, and they are what I use to
 answer "is this a disk problem or a shelf problem".
 
-Both need `sg3_utils` installed, plus `smp_utils` for the
+Both need `sg3_utils` and `lsscsi` installed, plus `smp_utils` for the
 topology tool. Root (or membership in a group that can read the sg devices)
 is required to read SES device nodes.
 
 ```sh
-dnf install -y sg3_utils
+dnf install -y sg3_utils lsscsi
 # smp_utils is not packaged for EL10/Rocky 10 - build it:
 dnf install -y gcc make
 curl -skL https://sg.danny.cz/sg/p/smp_utils-0.99.tgz | tar xz -C /tmp

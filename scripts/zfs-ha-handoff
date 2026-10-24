@@ -6,7 +6,7 @@
 # Resolves the strategy from pool.conf (strategy=auto probes the disk), then
 # execs strategies.d/<name>/handoff <op> <by-id> [args].
 #
-# Ops (contract in docs/REVIEW_MODULARITY.md 3.3):
+# Ops (strategy contract):
 #   probe <by-id>                    emit key=value capability lines
 #   release <by-id>                  clear THIS host's access (fail closed)
 #   recover <by-id> [--fence-evidence T]   aggressive recovery of dead owner

@@ -7,7 +7,7 @@ Implements the handoff algorithm in docs/HANDBOFF.md:
   monitor= pool health; SUSPENDED is NOT healthy (OCF_NOT_RUNNING)
 
 The disk list comes from /etc/zfs-ha/pool.conf (authoritative, written at
-pool creation) - NEVER from `zpool status` at runtime (REVIEW_MODULARITY D1).
+pool creation) - NEVER from `zpool status` at runtime (design invariant D1).
 
 Install as /usr/lib/ocf/resource.d/zfsha/Pool.
 
@@ -145,8 +145,7 @@ def host_reset_target():
     # sg nodes map to scsi devices via /sys/class/scsi_device/<h:c:t:l>/device
     for sg in sorted(glob.glob("/dev/sg*")):
         base = os.path.basename(sg)
-        link = os.path.realpath(f"/sys/class/scsi_device/{base}" if False else
-                                f"/sys/class/scsi_generic/{base}/device")
+        link = os.path.realpath(f"/sys/class/scsi_generic/{base}/device")
         if not os.path.isdir(link):
             continue
         # walk up to the scsi_host
@@ -321,9 +320,9 @@ def action_stop(env):
             handoff_op(env, "quiesce", disk)
         return 0
     # HANDBOFF steps 1-4: export -> release -> quiesce.
-    # Order per REVIEW_MODULARITY D6: resolve mappings first (handoff ops do
-    # this internally), quiesce (delete from OS) BEFORE release so nothing
-    # re-affiliates between release and delete.
+    # Release runs while the device is still in the OS (so the strategy can
+    # resolve the phy / clear the PR from the real device node), THEN the
+    # device is deleted (quiesce) so nothing re-affiliates afterwards.
     # sharenfs datasets are NFS-exported by the kernel nfsd, which holds the
     # dataset mount. Unmount them (and stop nfs-server) before export.
     run(["zfs", "unmount", "-a"], timeout=60)
@@ -334,13 +333,13 @@ def action_stop(env):
                  f"zpool export failed (stuck export?): {r.stderr.strip()} - "
                  "fencing required before takeover")
     for disk in disks:
-        rc, out = handoff_op(env, "quiesce", disk)
-        if rc != 0:
-            ocf_exit(OCF_ERR_GENERIC, f"quiesce failed for {disk}: {out}")
-    for disk in disks:
         rc, out = handoff_op(env, "release", disk)
         if rc != 0:
             ocf_exit(OCF_ERR_GENERIC, f"release failed for {disk}: {out}")
+    for disk in disks:
+        rc, out = handoff_op(env, "quiesce", disk)
+        if rc != 0:
+            ocf_exit(OCF_ERR_GENERIC, f"quiesce failed for {disk}: {out}")
     return 0
 
 

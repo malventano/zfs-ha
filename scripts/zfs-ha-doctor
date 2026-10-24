@@ -68,7 +68,7 @@ if [ -n "$POOL" ]; then
         elif [ "$present" -gt 0 ] && ! echo "$imported" | grep -qw "$POOL"; then
             state="DIRTY"
             warn "HA devices present but pool not imported - stale posture"
-            warn "run: zfs-ha-quiesce delete $POOL  (or import the pool)"
+            warn "run: zfs-ha-quiesce delete  (or import the pool)"
         fi
     fi
 fi

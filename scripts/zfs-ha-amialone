@@ -1,7 +1,7 @@
 #!/bin/sh
 # zfs-ha: "am I alone?" gate.
 #
-# Implements the safe decision procedure from docs/REVIEW_MODULARITY.md 4.6.
+# Implements the safe decision procedure: corroborating signals only, never a sole signal.
 # This is a GATE, not a promoter. Its only outputs:
 #   NOT_ALONE       - cluster is alive; do nothing, follow pacemaker
 #   ABSTAIN         - ambiguous; alert operator; import nothing
@@ -121,7 +121,7 @@ if [ -f "$CONF" ] && command -v ipmitool >/dev/null 2>&1; then
     fi
 fi
 
-# --- decision procedure (REVIEW_MODULARITY 4.6) ---
+# --- decision procedure ---
 verdict="ABSTAIN"
 reason=""
 

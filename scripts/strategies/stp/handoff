@@ -5,7 +5,7 @@
 # hardware-enforced single-initiator per disk; handoff requires SMP PHY
 # CONTROL operations through the expander.
 #
-# Contract (docs/REVIEW_MODULARITY.md 3.3): all ops take a by-id path and
+# Contract: all ops take a by-id path and
 # fail closed. Exit codes: 0 ok, 1 refused, 2 usage, 3 transient, 4 unsupported.
 set -u
 
@@ -96,16 +96,21 @@ resolve_phy_any() {
         fi
     fi
     # last resort: scan expanders via DISCOVER for the disk's SAS address
-    local e p addr
+    # (captured at cache time, NOT the WWN - DISCOVER reports SAS addresses,
+    # which for interposer'd SATA disks differ from the WWN)
+    local e p addr sasaddr
+    sasaddr=$(grep "^$wwn " "$cache" 2>/dev/null | awk '{print $4}')
+    if [ -z "$sasaddr" ]; then
+        # no cached SAS address either; try matching the WWN anyway (works
+        # for native SAS disks whose WWN == SAS addr suffix)
+        sasaddr="$wwn"
+    fi
     for e in /dev/bsg/expander-*; do
         [ -e "$e" ] || continue
-        addr=$(smp_discover "$e" 2>/dev/null | grep -i "$wwn" | head -1)
+        addr=$(smp_discover "$e" 2>/dev/null | grep -i "$sasaddr" | head -1)
         [ -n "$addr" ] || continue
-        # discover output lines contain the disk sas addr; phy id is the first field
         p=$(echo "$addr" | awk '{print $2}' | tr -d ':')
-        # fall back: REPORT GENERAL on each phy is too slow; use smp_discover_list
-        # not implemented - require cache
-        break
+        [ -n "$p" ] && { echo "$e $p"; return 0; }
     done
     die "cannot resolve phy for $byid (device absent, no cached mapping)"
 }
@@ -206,6 +211,21 @@ cmd_quiesce() {
     sd=$(basename "$(readlink -f "$byid" 2>/dev/null)")
     [ -n "$sd" ] || { echo "quiesce: cannot resolve $byid" >&2; exit 1; }
     if [ -e "/sys/block/$sd/device/delete" ]; then
+        # cache the phy mapping BEFORE deleting the device - resolve_phy_any
+        # needs it when the device is gone (release after quiesce)
+        local map wwn bsg phy
+        map=$(resolve_phy "$byid" 2>/dev/null) || map=""
+        if [ -n "$map" ]; then
+            wwn=$(basename "$byid" | sed 's/^wwn-0x//')
+            bsg=$(echo "$map" | awk '{print $1}')
+            phy=$(echo "$map" | awk '{print $2}')
+            mkdir -p /run/zfs-ha
+            grep -v "^$wwn " /run/zfs-ha/phymap 2>/dev/null > /run/zfs-ha/phymap.tmp || true
+            local enddev
+            enddev=$(readlink -f "/sys/block/$sd/device" 2>/dev/null | grep -o 'end_device-[0-9]*:[0-9]*:[0-9]*' | head -1)
+            echo "$wwn $bsg $phy $(cat /sys/class/sas_device/$enddev/sas_address 2>/dev/null)" >> /run/zfs-ha/phymap.tmp
+            mv /run/zfs-ha/phymap.tmp /run/zfs-ha/phymap
+        fi
         echo 1 > "/sys/block/$sd/device/delete" || { echo "quiesce: delete failed" >&2; exit 1; }
         echo "quiesced: $byid ($sd)"
     else
@@ -232,11 +252,22 @@ cmd_rescan() {
         echo "rescanned: $byid present"
         exit 0
     fi
-    # plain scan insufficient (transport dropped it) -> host reset
-    local sg
-    sg=$(ls /dev/bsg/${host#host}:0:0 2>/dev/null | head -1)
-    sg=$(readlink -f "/sys/class/sas_host/$host/device/scsi_host/$host" 2>/dev/null)
-    sg_reset -H "/dev/bsg/${host#host}:0:0" >/dev/null 2>&1 || true
+    # plain scan insufficient (transport dropped it) -> host reset.
+    # sg_reset operates on /dev/sgN nodes, NOT bsg - resolve the HBA's sg
+    # node by walking /sys/class/scsi_generic up to the SAS host.
+    local sgnode sgdev
+    for sgdev in /sys/class/scsi_generic/sg*; do
+        [ -e "$sgdev/device" ] || continue
+        if readlink -f "$sgdev/device" 2>/dev/null | grep -q "scsi_host/$host/"; then
+            sgnode="/dev/$(basename "$sgdev")"
+            break
+        fi
+    done
+    if [ -n "$sgnode" ]; then
+        sg_reset -H "$sgnode" >/dev/null 2>&1 || true
+    else
+        echo "rescan: cannot resolve sg node for $host; skipping host reset" >&2
+    fi
     sleep 15
     udevadm settle --timeout=30 2>/dev/null
     if [ -e "$(readlink -f "$byid" 2>/dev/null)" ]; then

@@ -12,7 +12,7 @@
 #
 # The resulting /etc/zfs-ha/pool.conf is the single source of truth for every
 # tool (zfsha-pool, zfs-ha-quiesce, zfs-ha-doctor, posture unit). It must
-# NEVER be derived from `zpool status` at runtime - see REVIEW_MODULARITY D1.
+# NEVER be derived from `zpool status` at runtime - design invariant D1.
 set -u
 
 CONF_DIR="/etc/zfs-ha"
@@ -61,7 +61,7 @@ for d in $DISKS; do
     esac
 done
 
-# 3. strategy preflight (REVIEW_MODULARITY 3.5): sas/null without fencing is a
+# 3. strategy preflight: sas/null without fencing is a
 #    configuration error - removing the shelf's accidental single-initiator
 #    protection moves the entire safety burden to fencing.
 case "$STRATEGY" in

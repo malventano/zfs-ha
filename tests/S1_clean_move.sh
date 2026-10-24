@@ -34,10 +34,10 @@ done
 #    this (rescan -> acquire with evidence -> import); here we drive the
 #    same steps by hand so the primitive is tested independently of
 #    pacemaker.
-echo "step 3: acquire + import on remote node"
+echo "step 3: rescan + acquire + import on remote node (RA order: rescan, then acquire)"
 ssh "$REMOTE" "for d in \$(zfs-ha-config get disks | tr ',' ' '); do
-                   zfs-ha-handoff acquire \"\$d\" || exit 1
                    zfs-ha-handoff rescan \"\$d\" || exit 1
+                   zfs-ha-handoff acquire \"\$d\" || exit 1
                done
                zpool import -f $POOL"
 

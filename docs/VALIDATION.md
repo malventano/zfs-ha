@@ -120,7 +120,7 @@ Tested on host B (host A down for power cycle at the time). Disks: 4x
 WD30EFRX 3TB (bays 1, 5, 7, 11), affiliation-cleared via phy hard reset
 after the previous owner's stale affiliations.
 
-### RAIDZ1 (3 disks, ~5.4T usable)
+### RAIDZ1 (3 of the 4 disks in a raidz1, ~5.4T usable; the 4th was used for the RAIDZ2 test below)
 
 - Pool created with `multihost=on`, separate cachefile
   (`/etc/zfs/zpool.cachefile.ha`) for boot-import prevention.
@@ -262,7 +262,7 @@ outgoing owner's pool suspended (MMP) and the RA then deleted the devices
 Consequences for the design:
 
 1. The RA must not quiesce devices while the pool is SUSPENDED - that
-   state requires fencing escalation, not device deletion. (Fix tracked;
+   state requires fencing escalation, not device deletion. (Not yet implemented as a check;
    current RA exports first and only quiesces after a clean export, so
    this window requires the export to have already failed/suspended.)
 2. A failed stop must escalate to fencing (pacemaker does this naturally

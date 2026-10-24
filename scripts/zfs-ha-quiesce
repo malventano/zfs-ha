@@ -7,7 +7,7 @@
 # the disk list always comes from pool.conf.)
 #
 # The disk list comes from /etc/zfs-ha/pool.conf (authoritative, written at
-# pool creation) - NEVER from `zpool status` at runtime (REVIEW_MODULARITY D1:
+# pool creation) - NEVER from `zpool status` at runtime (design invariant D1:
 # zpool status fails when the pool is not imported, which is exactly when the
 # quiesce matters).
 #
@@ -92,7 +92,7 @@ cmd_status() {
     fi
 }
 
-[ $# -ge 1 ] || { echo "usage: $0 {delete|rescan|status} [pool]" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "usage: $0 {delete|rescan|status}" >&2; exit 2; }
 case "$1" in
     delete) cmd_delete ;;
     rescan) cmd_rescan ;;

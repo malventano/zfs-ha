@@ -46,6 +46,8 @@ dnf --enablerepo=highavailability install -y cockpit cockpit-ha-cluster
 systemctl enable --now cockpit.socket
 firewall-cmd --permanent --add-service=cockpit && firewall-cmd --reload
 
+dnf install -y sg3_utils lsscsi
+
 # smp_utils is NOT packaged for EL10/Rocky 10 - build it
 dnf install -y gcc make
 curl -skL https://sg.danny.cz/sg/p/smp_utils-0.99.tgz | tar xz -C /tmp
@@ -181,12 +183,12 @@ management do it) and set the per-host role:
 ```sh
 # on the primary:
 zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd> \
-    --role primary --peer <nodeB-ip-or-name>
+    --role primary --peer <nodeB-name>
 scp /etc/zfs-ha/pool.conf <nodeB>:/etc/zfs-ha/pool.conf
 
 # on the secondary (after copying):
 zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd> \
-    --role secondary --peer <nodeA-ip-or-name>
+    --role secondary --peer <nodeA-name>
 
 # on both:
 zfs-ha-udevrule generate && udevadm control --reload
@@ -240,7 +242,7 @@ through when the cluster promotes this host.
 Verify after a reboot: `zpool list` shows the HA pool **not imported** on
 either node until Pacemaker starts it, `zfs-ha-quiesce status` shows 0/N
 devices present, and `journalctl -t zfs-ha-udev` shows the deletions.
-`check_boot_import.sh <POOL>` runs the whole check for you.
+`check_boot_import <POOL>` runs the whole check for you (installed as `check_boot_import`).
 
 Optionally, install the boot-time posture unit as a second layer (it
 deletes all HA-pool devices before the ZFS import services run):
@@ -450,9 +452,10 @@ Honest limitations, so you know what you're buying:
 
 This is the decision that shapes everything else. The `stp` path and the
 controlled cutover protocol are fully validated (see `docs/VALIDATION.md`);
-the `sas`/PR path is implemented and exercised on the reference shelf but
-not yet in the formal test matrix; the `null` path is designed, not
-validated. They are not equally proven, and the docs say which is which.
+the `sas`/PR path is live-verified end to end (VALIDATION.md V11), though
+the full pacemaker-driven failover matrix for it is still pending (V11
+caveat, V13); the `null` path is designed, not validated. They are not
+equally proven, and the docs say which is which.
 
 ### 12.1 SAS + interposers - the best setup (recommended)
 
@@ -563,7 +566,9 @@ zfs-ha-pr release <by-id>            # planned handoff: drop reservation
 zfs-ha-pr preempt <by-id> <victim-key>   # FENCED takeover from a dead owner
 ```
 
-Exercised on the reference shelf (not yet in the formal validation record):
+Live-verified on the reference shelf (VALIDATION.md V11); the full
+pacemaker-driven failover matrix (preempt on dead owner, reservation
+surviving controller path failover) is still pending (V11 caveat, V13):
 
 - Peer reads succeed while the owner holds the reservation (type 5 allows
   reads); peer writes fail with `reservation conflict` in dmesg and ZFS

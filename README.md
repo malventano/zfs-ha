@@ -34,18 +34,18 @@ can do. The catch - and the reason this repo exists - is that the hard part
 depends entirely on what kind of disks are in the shelf. This project solves
 all three disk paths and documents where each one is appropriate.
 
-**Status: working, validated end-to-end on real hardware.** What the
-validation record (`docs/VALIDATION.md`) actually covers: the STP disk-handoff
-primitive (SATA affiliation release/acquire/recover, with data integrity
-checks), the cluster stack (corosync dual-ring, two-node quorum), pacemaker
-resource failover with VIP colocation, boot-time quiesce, NFS cutover via
-the ZFS `sharenfs` property (zero client gaps > 2s), and three consecutive
-full round-trips of a 4x3TB raidz1 via the controlled cutover protocol. The
-SCSI persistent reservation path (`zfs-ha-pr`, the `sas` strategy) is
-**implemented and exercised on the reference shelf** (peer writes get
-RESERVATION CONFLICT while the owner holds the reservation) but is not yet
-in the formal validation record - treat it as validated-by-exercise, not
-validated-by-test-matrix. The `null` strategy is designed, not validated.
+**Status: working, validated end-to-end on real hardware.** The validation
+record (`docs/VALIDATION.md`) covers: the STP disk-handoff primitive (SATA
+affiliation release/acquire/recover, with data integrity checks, V2-V10),
+the cluster stack (corosync dual-ring, two-node quorum, V7), a pacemaker
+failover cutover with data verified intact on the new owner (V13 - partial:
+move-back, crash takeover, and fenced takeover are still pending), the
+SCSI persistent reservation path live-verified end to end (V11), the
+SUSPENDED-pool wedge failure mode and its lessons (V12), the controlled
+cutover protocol (three consecutive full round-trips of a 4x3TB raidz1,
+documented in HOWTO §12.3), and boot-time quiesce + NFS cutover via
+`sharenfs` (documented in HANDBOFF). The `null` strategy is designed, not
+validated.
 
 ## Why this is subtle
 
@@ -92,7 +92,7 @@ scripts/
   zfs-ha-cutover        controlled cutover protocol (no-transport-release
                         disks, planned maintenance)
   fence_zfs_ha_stp      stonith fence agent: SAS/STP storage isolation
-  check_boot_import.sh  verifies no boot-time auto-import
+  check_boot_import.sh  verifies no boot-time auto-import (installed as `check_boot_import`)
   strategies/           stp/ sas/ null/ handoff strategy plugins
                         (installed to /usr/lib/zfs-ha/strategies.d/)
 configs/
@@ -123,7 +123,7 @@ disks=/dev/disk/by-id/wwn-0x5000c500a1b2c3d4,/dev/disk/by-id/wwn-0x5000c500a1b2c
 strategy=sas
 fencing=pr
 role=primary
-peer=10.200.1.8
+peer=<nodeB-ip>
 
 # optional (zfs-ha-amialone signals; all off unless set):
 # mailbox=/dev/disk/by-id/scsi-35000c9...
@@ -144,7 +144,7 @@ strategy**, which is how the different hardware paths plug in:
 | `sas` | SAS disks, or SATA behind interposers | SCSI persistent reservations: register + reserve on start, release on stop, preempt on fenced takeover |
 | `null` | shelf enforces nothing | no transport action at all; safe only with real fencing, MMP as the backstop |
 
-`strategy=auto` probes a disk and picks. The dispatcher is
+`strategy=auto` probes a disk and picks (note: auto can only ever select `stp` or fall back to `null` - set `sas` explicitly for SAS/interposer disks). The dispatcher is
 `zfs-ha-handoff`; each strategy implements the same six-op contract
 (`probe`, `release`, `recover`, `acquire`, `quiesce`, `rescan`) and fails
 closed. Adding a fourth hardware path means writing one new script under
@@ -174,7 +174,7 @@ confusion:
   a while, he's probably dead".
 
 The role is just a line in pool.conf (`role=primary` / `role=secondary`,
-plus `peer=<address>`), set by `zfs-ha-poolconf write ... --role primary --peer <nodeB-ip>` (and the mirror on the secondary), and
+plus `peer=<address>` - which must match the **pcs node name** (what `pcs status` prints, i.e. what you passed to `pcs cluster setup`), not necessarily an IP), set by `zfs-ha-poolconf write ... --role primary --peer <nodeB-name>` (and the mirror on the secondary), and
 enforced at boot by `zfs-ha-role`. Asymmetric fencing delays
 (`pcmk_delay_max`) make the primary the deterministic survivor of a
 simultaneous failure. Disable automatic failback: when the primary comes
@@ -212,9 +212,9 @@ zpool create -o multihost=on -o cachefile=/etc/zfs/zpool.cachefile.ha <POOL> \
 # 5. record the config + boot-time quiesce rule (run on the primary, then
 #    copy /etc/zfs-ha/pool.conf to the peer and set role/peer per host)
 zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd> \
-    --role primary --peer <nodeB-ip>          # on the primary
+    --role primary --peer <nodeB-name>          # on the primary; peer= must match the pcs node name
 zfs-ha-poolconf write <POOL> --strategy <stp|sas|null> --fencing <none|pr|bmc|pdu|pikvm|sbd> \
-    --role secondary --peer <nodeA-ip>        # on the secondary
+    --role secondary --peer <nodeA-name>        # on the secondary
 zfs-ha-udevrule generate && udevadm control --reload
 
 # 6. NFS via sharenfs (the export travels with the pool)
@@ -287,4 +287,4 @@ project's `sas` strategy converges to the same simplicity.
 
 ## License
 
-GPL-2.0-or-later (matching the Linux kernel and smp_utils).
+GPL-2.0-or-later (matching the Linux kernel).
