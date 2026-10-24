@@ -164,10 +164,12 @@ cmd_rescan() {
     if command -v multipathd >/dev/null 2>&1; then
         multipathd reconfigure >/dev/null 2>&1 || true
     fi
-    local host="" h
+    local host="" h e
     for h in /sys/class/sas_host/*; do
         host=$(basename "$h")
-        [ -e "/dev/bsg/expander-${host#host}:"* ] && break
+        for e in /dev/bsg/expander-${host#host}:*; do
+            [ -e "$e" ] && break 2
+        done
         host=""
     done
     [ -n "$host" ] && echo "- - -" > "/sys/class/scsi_host/$host/scan" 2>/dev/null
