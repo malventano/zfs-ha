@@ -287,3 +287,36 @@ fence_zfs_ha_stp stonith resource, ha_pool (ocf:zfsha:Pool) + ha_vip
 - Incomplete: the full move matrix (move back, crash-of-owner takeover,
   fenced takeover) was interrupted by the V12 wedge and the manual host
   restart. To be completed.
+
+## V14. Fenced takeover - found and fixed two recovery-path defects
+
+Date: 2026-10-24. During the fenced-takeover leg of the failover matrix,
+two defects surfaced that only appear when the fence fires while the
+owner is live:
+
+1. **udev quiesce rule vs. rescan race.** After the fence cleared the
+   owner's affiliations, the acquiring host's rescan brought the disks
+   back - and the udev quiesce rule deleted them within a second, because
+   the allow-import flag was not held across the (10-30s) mpt3sas
+   rediscovery window. Every device that re-attached after the RA's flag
+   window expired was deleted before the import could see it. Symptom:
+   endless "missing: <disk>" start failures despite the phy resets
+   working. Fix: the strategy rescan ops now hold the allow-import flag
+   (reference-counted) for the entire rediscovery sequence.
+2. **preempt on an unregistered key.** The fence left the dead owner's PR
+   registration + reservation in place. `zfs-ha-pr preempt` first tries
+   to register our own key - which this shelf refuses while any
+   reservation exists (the same quirk documented in §12.1c). Fix: when we
+   hold no registration, preempt using the victim's own key as rk/sark,
+   then register + reserve.
+
+Also confirmed live: the fence agent itself works (fence cleared all of
+the owner's disk affiliations at the shelf; the fenced host's pacemaker
+self-terminated with "We were allegedly just fenced"), and the fenced
+host's pool import attempt correctly failed with "pool is imported on
+host 'zfs-ha-a'" - MMP refusing dual ownership.
+
+Recovery sequence that converged (documented for operators):
+phy hard reset on peer-affiliated phys -> clear the dead owner's PR
+registration (clear --param-rk=<victim-key>) -> rescan with allow-import
+held -> zpool import -f -> pcs resource cleanup.
