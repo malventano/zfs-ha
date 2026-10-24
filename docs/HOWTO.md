@@ -569,6 +569,17 @@ Exercised on the reference shelf (not yet in the formal validation record):
   reads); peer writes fail with `reservation conflict` in dmesg and ZFS
   faults the vdev with "too many errors" if you import anyway. That is the
   fencing working - clear the reservation before acquiring, or preempt.
+- **Live-verified end to end (2026-10-23):** reserve on host A → peer's
+  `dd oflag=direct` write fails with `Invalid exchange` (reservation
+  conflict at drive firmware, visible as `reservation conflict error` in
+  dmesg) → release on A → peer write succeeds again. The full
+  register/reserve/held/status/release cycle works through the
+  dual-controller shelf.
+- **Gotcha: `PR generation=0xNN` looks like a key.** `sg_persist -k`
+  output's generation line matches a naive `0x...` grep, which sent
+  `zfs-ha-pr register` down the replace-existing-key path (refused by this
+  shelf). Fixed in the tool; if you roll your own parsing, exclude the
+  generation line.
 - **Shelf quirk (DS460C + interposers):** `REGISTER` with `--param-sark`
   (replace existing key) fails with a conflict while any reservation
   exists. `zfs-ha-pr reserve` handles this by falling back to
@@ -661,7 +672,10 @@ between the hosts for the configured user.
 Validated: three consecutive full round-trips of the 4x3TB raidz1 pool
 between the two hosts, each direction verified with data written on one
 host and read on the other. Total cutover time ~30-40 s per direction
-(dominated by the settle delays; deliberately conservative).
+(dominated by the settle delays; deliberately conservative). Also
+validated live under pacemaker: a `pcs resource move` cutover with the
+pool data verified intact on the new owner afterwards (marker file
+written pre-move read back byte-identical post-move).
 
 **One mailbox SAS disk helps clustering here.** A dedicated SAS disk
 (dual-port, no STP affiliation) visible to both hosts can act as a
@@ -798,6 +812,16 @@ implementation that cost the most time. Read before your first cutover.
   once you have confirmed sole ownership. Setting
   `zfs_multihost_fail_intervals=0` disables the suspension entirely but
   also disables the split-brain backstop - not recommended.
+- *A SUSPENDED pool with its devices deleted underneath it is the worst
+  state.* If the pool suspends and the devices then disappear (quiesce,
+  udev rule, peer takeover), `zpool export` and `zpool clear` wedge in
+  D-state waiting on a txg sync to vdevs that no longer exist. `kill -9`
+  does nothing to D-state processes. Every subsequent `zpool` command on
+  the host hangs behind them. The only clean fix is a host restart - do
+  not burn an hour trying to unwedge it (measured: 37 minutes of D-state
+  before giving in). This is why the RA must never quiesce devices before
+  a SUSPENDED pool is resolved, and why fencing escalation on a failed
+  stop matters.
 - *MMP suspend deadlock after a failed import.* If an import suspends
   (MMP writes failed during disk settle), the importing host cannot export
   or clear, and its kernel keeps retrying MMP writes - which re-affiliates

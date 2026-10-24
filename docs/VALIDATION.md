@@ -220,3 +220,70 @@ not touch the disks after step 2 (stop smartd/udisks2 or fence it).
 Across all the churn in this session (multiple imports/exports, phy resets,
 MMP suspends, one host power cycle), every sha256 verification of the 5GB
 test dataset passed. No corruption at any point.
+
+## V11. SCSI persistent reservation fencing (sas strategy) - live verified
+
+Date: 2026-10-23. Hardware: DS460C dual-controller cabling, WD30EFRX 3TB
+disks behind interposers, one host per controller.
+
+- `zfs-ha-pr key` produces stable per-host keys (`0x5a17` + md5(hostname)).
+- `zfs-ha-pr reserve` registers and takes the type-5 (Write Exclusive,
+  Registrants Only) reservation; `held` confirms; `status` shows the key
+  and reservation holder.
+- While host A held the reservation, host B's direct write
+  (`dd oflag=direct`) failed with `Invalid exchange` - the drive-firmware
+  reservation conflict, visible as `reservation conflict error` in dmesg.
+  Reads still passed (type 5 semantics).
+- `zfs-ha-pr release` dropped the reservation; host B's write then
+  succeeded. Generation counter incremented as expected.
+- Bug found and fixed during this test: `sg_persist -k` output's
+  `PR generation=0xNN` line matched a naive key grep, sending register
+  down the replace-existing path (refused by this shelf). The tool now
+  excludes the generation line.
+- Caveat: this validates the primitive and the tooling. The full
+  pacemaker-driven `fencing=pr` failover matrix (preempt on dead owner,
+  reservation surviving controller path failover) is still pending - the
+  reference cluster's failover testing was interrupted by an unrelated
+  host wedge (see V12).
+
+## V12. SUSPENDED-pool-with-deleted-devices wedge (known failure mode)
+
+Date: 2026-10-23. During a pacemaker `pcs resource move` cutover, the
+outgoing owner's pool suspended (MMP) and the RA then deleted the devices
+(quiesce) underneath the suspended pool. Result:
+
+- `zpool export -f` and `zpool clear` wedged in D-state (txg_wait_synced
+  to vdevs that no longer exist), surviving `kill -9`.
+- Every subsequent `zpool` command on the host hung behind them (37+
+  minutes observed before the host was taken down for a manual restart).
+- The pool data itself was fine: the new owner imported it and all files
+  were verified intact (marker written pre-move read back byte-identical).
+
+Consequences for the design:
+
+1. The RA must not quiesce devices while the pool is SUSPENDED - that
+   state requires fencing escalation, not device deletion. (Fix tracked;
+   current RA exports first and only quiesces after a clean export, so
+   this window requires the export to have already failed/suspended.)
+2. A failed stop must escalate to fencing (pacemaker does this naturally
+   when stonith is configured) - the wedged host cannot clean itself.
+3. D-state `zpool` processes are unkillable; the only recovery is a host
+   restart. Do not burn time trying to unwedge.
+
+## V13. Pacemaker failover cutover (partial - data path verified)
+
+Date: 2026-10-23. Cluster: corosync dual-ring, two-node quorum,
+fence_zfs_ha_stp stonith resource, ha_pool (ocf:zfsha:Pool) + ha_vip
+(IPaddr2) with colocation and stop ordering.
+
+- Cluster bring-up: both nodes online, quorate, resources started on the
+  primary, VIP up on the client NIC.
+- `pcs resource move ha_pool`: VIP torn down before the pool (ordering
+  constraint working), pool exported on the old owner, imported on the
+  new owner, data verified intact.
+- Role arbitration verified live: the secondary-role host stood down
+  (refused to import) while the primary held the pool, including during
+  the 180s PEER_WAIT window after a peer failure.
+- Incomplete: the full move matrix (move back, crash-of-owner takeover,
+  fenced takeover) was interrupted by the V12 wedge and the manual host
+  restart. To be completed.
