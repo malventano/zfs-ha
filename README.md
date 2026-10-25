@@ -1,9 +1,8 @@
 # zfs-ha: Active/Standby ZFS File Server on a Shared SAS Disk Shelf
 
-Two commodity hosts, one used SAS disk shelf, one ZFS pool that is always
-imported on exactly one host at a time. NFS and Samba fail over with the
-pool. Pacemaker + corosync two-node cluster. Everything here is open source
-and runs on hardware you can buy used for a few hundred dollars.
+Our goal is one set of disks with two hosts for high availability. That's two commodity hosts, one used SAS disk shelf, and one ZFS pool that is always imported on exactly one host at a time. NFS and Samba fail over with the pool. Pacemaker + corosync two-node cluster. Everything here is open source and runs on hardware you can buy used for a few hundred dollars.
+
+This is "table stakes" enterprise stuff. But while working on this it turned out to be less accessible than I'd like in a small office / homelab type scenario.
 
 ```
         ┌──────────────┐          ┌──────────────┐
@@ -12,7 +11,7 @@ and runs on hardware you can buy used for a few hundred dollars.
         └──┬───────┬───┘          └──┬───────┬───┘
            │       │                 │       │
      client net  SAS HBA        SAS HBA   client net
-      + VIP      │                 │       + VIP (fails over)
+        + VIP      │                 │       + VIP (fails over)
            │       └───────┬─────────┘       │
            │               │                 │
            │        ┌──────┴───────┐         │
@@ -28,47 +27,21 @@ and runs on hardware you can buy used for a few hundred dollars.
                  └─────────────┘
 ```
 
-This is the project I built because commercial HA-ZFS products charge
-$25-30k for what two used servers, a used NetApp DS460C, and some patience
-can do. The catch - and the reason this repo exists - is that the hard part
-depends entirely on what kind of disks are in the shelf. This project solves
-all three disk paths and documents where each one is appropriate.
+This is the project I built because commercial HA-ZFS products charge $25-30k for what two used servers, a used NetApp DS460C, and some patience can do. The catch - and the reason this repo exists - is that the hard part depends entirely on what kind of disks are in the shelf, moreso than I thought it would. 
 
-**Status: working, validated end-to-end on real hardware.** The validation
-record (`docs/VALIDATION.md`) covers: the STP disk-handoff primitive (SATA
-affiliation release/acquire/recover, with data integrity checks, V2-V10),
-the cluster stack (corosync dual-ring, two-node quorum, V7), a **full
-pacemaker failover matrix - planned move, crash takeover, and fenced
-takeover - all PASS with data verified** (V13-V15, including two
-recovery-path defects found and fixed during fenced takeover, V14), the
-SCSI persistent reservation path live-verified end to end (V11), the
-SUSPENDED-pool wedge failure mode and its lessons (V12), the controlled
-cutover protocol (three consecutive full round-trips of a 4x3TB raidz1,
-documented in HOWTO §12.3), and boot-time quiesce + NFS cutover via
-`sharenfs` (documented in HANDBOFF). The `null` strategy is designed, not
-validated.
+This project solves ("solves") all three disk paths and documents how it works in each scenario.  
+
+**Status: working, validated end-to-end on real hardware.** The validation record (`docs/VALIDATION.md`) covers: the STP disk-handoff primitive (SATA affiliation release/acquire/recover, with data integrity checks, V2-V10), the cluster stack (corosync dual-ring, two-node quorum, V7), a **full pacemaker failover matrix - planned move, crash takeover, and fenced takeover - all PASS with data verified** (V13-V15, including two recovery-path defects found and fixed during fenced takeover, V14), the SCSI persistent reservation path live-verified end to end (V11), the SUSPENDED-pool wedge failure mode and its lessons (V12), the controlled cutover protocol (three consecutive full round-trips of a 4x3TB raidz1, documented in HOWTO §12.3), and boot-time quiesce + NFS cutover via `sharenfs` (documented in HANDBOFF). The `null` strategy is designed, not validated. I added this as an attempt to sort-of memorialize institional knowledge; I know from exeperience it won't always work this way if your underlying hardware is a bit different from mine. 
 
 ## Why this is subtle
 
-The whole problem is one question: **when one host dies, how does the other
-one know it is safe to touch the disks?** The answer depends on your disks:
+The whole problem is one question: **when one host dies, how does the other one know it is safe to touch the disks?** The answer depends on your disks:
 
-- **SATA disks behind a SAS expander** (the common case in cheap shelves)
-  use the SATA Tunneling Protocol. Each disk maintains an *affiliation* with
-  exactly one initiator port - the shelf hardware enforces single-owner
-  access. That is actually good (free split-brain protection at the
-  hardware level), but failover requires actively releasing the affiliation,
-  and a crashed owner leaves a *stale* one that must be hard-reset at the
-  phy level. This is the hard path, and it is fully solved here.
-- **SAS disks** (or SATA behind good interposers) have no exclusivity at
-  all: both hosts can always issue I/O. You must add your own fencing, and
-  the right tool is SCSI persistent reservations - the disk itself refuses
-  writes from anyone but the owner, at drive-firmware level, independent of
-  both operating systems.
-- **Plain SATA with no transport release** (no interposers, dumb shelf) has
-  nothing to release and nothing to lock. For that case there is a
-  controlled cutover protocol for planned maintenance, and an honest
-  warning that emergency failover has no clean answer without PR support.
+- **SATA disks behind a SAS expander** (the common case in cheap shelves) use the SATA Tunneling Protocol. Each disk maintains an *affiliation* with exactly one initiator port - the shelf hardware enforces single-owner access. That is actually good (free split-brain protection at the hardware level), but failover requires actively releasing the affiliation, and a crashed owner leaves a *stale* one that must be hard-reset at the phy level. This is the hard path, and it is fully solved here.
+- **SAS disks** (or SATA behind good interposers) have no exclusivity at all: both hosts can always issue I/O. You must add your own fencing, and the right tool is SCSI persistent reservations - the disk itself refuses writes from anyone but the owner, at drive-firmware level, independent of both operating systems.
+- **Plain SATA with no transport release** (no interposers, dumb shelf) has nothing to release and nothing to lock. For that case there is a controlled cutover protocol for planned maintenance, and an honest warning that emergency failover has no clean answer without PR support.
+
+If you need a bit more context on this, I suggest you watch the Level1Techs video that goes with this repository. 
 
 ## What's in the repo
 
@@ -117,8 +90,7 @@ docs/
 
 ### What the scripts do, and how the strategies fit
 
-Everything keys off one file, `/etc/zfs-ha/pool.conf`, written once at pool
-creation by `zfs-ha-poolconf`:
+Everything keys off one file, `/etc/zfs-ha/pool.conf`, written once at pool creation by `zfs-ha-poolconf`:
 
 ```ini
 pool=red3t
@@ -137,52 +109,27 @@ peer=<nodeB-ip>
 # peer_bmc_pass=...
 ```
 
-That file is the single source of truth for the pool name, the exact disks
-(by-id, never `/dev/sdX`), and - most importantly - the **handoff
-strategy**, which is how the different hardware paths plug in:
+That file is the single source of truth for the pool name, the exact disks (by-id, never `/dev/sdX`), and - most importantly - the **handoff strategy**, which is how the different hardware paths plug in:
 
-| strategy | hardware | how handoff works |
-|---|---|---|
-| `stp` | SATA disks behind a SAS expander | SMP PHY CONTROL through the expander: release the affiliation on stop, verify it clear + re-acquire on start, phy hard reset to recover a crashed owner |
-| `sas` | SAS disks, or SATA behind interposers | SCSI persistent reservations: register + reserve on start, release on stop, preempt on fenced takeover |
+| strategy | hardware | how handoff works | 
+|---|---|---| 
+| `stp` | SATA disks behind a SAS expander | SMP PHY CONTROL through the expander: release the affiliation on stop, verify it clear + re-acquire on start, phy hard reset to recover a crashed owner | 
+| `sas` | SAS disks, or SATA behind interposers | SCSI persistent reservations: register + reserve on start, release on stop, preempt on fenced takeover | 
 | `null` | shelf enforces nothing | no transport action at all; safe only with real fencing, MMP as the backstop |
 
-`strategy=auto` probes a disk and picks (note: auto can only ever select `stp` or fall back to `null` - set `sas` explicitly for SAS/interposer disks). The dispatcher is
-`zfs-ha-handoff`; each strategy implements the same six-op contract
-(`probe`, `release`, `recover`, `acquire`, `quiesce`, `rescan`) and fails
-closed. Adding a fourth hardware path means writing one new script under
-`strategies.d/`, not touching anything else.
+`strategy=auto` probes a disk and picks (note: auto can only ever select `stp` or fall back to `null` - set `sas` explicitly for SAS/interposer disks). The dispatcher is `zfs-ha-handoff`; each strategy implements the same six-op contract (`probe`, `release`, `recover`, `acquire`, `quiesce`, `rescan`) and fails closed. Adding a fourth hardware path means writing one new script under `strategies.d/`, not touching anything else.
 
-The **resource agent** (`zfsha-pool`, installed as `ocf:zfsha:Pool`) is what
-pacemaker actually runs. On `start` it rescans, demands positive exclusivity
-evidence (affiliation clear, reservation held, or fence verified - it will
-not import on a guess), and imports. On `stop` it unmounts, exports,
-quiesces the devices out of the OS, and releases. On `monitor` it treats a
-SUSPENDED pool as not-running, which is what you want.
+The **resource agent** (`zfsha-pool`, installed as `ocf:zfsha:Pool`) is what pacemaker actually runs. On `start` it rescans, demands positive exclusivity evidence (affiliation clear, reservation held, or fence verified - it will not import on a guess), and imports. On `stop` it unmounts, exports, quiesces the devices out of the OS, and releases. On `monitor` it treats a SUSPENDED pool as not-running, which is what you want.
 
 ### Primary and secondary nodes
 
-The two hosts are **not** symmetric, and saying so out loud avoids a lot of
-confusion:
+The two hosts are **not** symmetric, and saying so out loud avoids a lot of confusion:
 
-- The **primary** is the host the pool lives on when everything is healthy.
-  It boots, waits for corosync/pacemaker, and starts the pool. If the
-  cluster is down entirely (peer not responding), it starts the pool anyway
-  - it is the designated owner, and refusing to start because the peer is
-  gone would turn a one-host outage into a two-host outage.
-- The **secondary** boots, waits a few minutes, checks whether the primary
-  is actually up (cluster + pool), and stands down if it is. Only if the
-  primary is verifiably not coming back does it take over - and takeover
-  still routes through fencing, never through "I haven't heard from him in
-  a while, he's probably dead".
+- The **primary** is the host the pool lives on when everything is healthy.  It boots, waits for corosync/pacemaker, and starts the pool. If the cluster is down entirely (peer not responding), it starts the pool anyway
+  - it is the designated owner, and refusing to start because the peer is gone would turn a one-host outage into a two-host outage.
+- The **secondary** boots, waits a few minutes, checks whether the primary is actually up (cluster + pool), and stands down if it is. Only if the primary is verifiably not coming back does it take over - and takeover still routes through fencing, never through "I haven't heard from him in a while, he's probably dead".
 
-The role is just a line in pool.conf (`role=primary` / `role=secondary`,
-plus `peer=<address>` - which must match the **pcs node name** (what `pcs status` prints, i.e. what you passed to `pcs cluster setup`), not necessarily an IP), set by `zfs-ha-poolconf write ... --role primary --peer <nodeB-name>` (and the mirror on the secondary), and
-enforced at boot by `zfs-ha-role`. Asymmetric fencing delays
-(`pcmk_delay_max`) make the primary the deterministic survivor of a
-simultaneous failure. Disable automatic failback: when the primary comes
-back from maintenance, it comes back as a standby until you deliberately
-move the pool back.
+The role is just a line in pool.conf (`role=primary` / `role=secondary`, plus `peer=<address>` - which must match the **pcs node name** (what `pcs status` prints, i.e. what you passed to `pcs cluster setup`), not necessarily an IP), set by `zfs-ha-poolconf write ... --role primary --peer <nodeB-name>` (and the mirror on the secondary), and enforced at boot by `zfs-ha-role`. Asymmetric fencing delays (`pcmk_delay_max`) make the primary the deterministic survivor of a simultaneous failure. Disable automatic failback: when the primary comes back from maintenance, it comes back as a standby until you deliberately move the pool back.
 
 ## Quick start
 
@@ -241,57 +188,28 @@ Full guide: `docs/HOWTO.md`.
 
 Non-negotiable; every scenario in `tests/` enforces one or more:
 
-1. **No import without exclusivity.** A node imports the HA pool only after
-   a verified clean release by the previous owner, or after successful
-   fencing of an uncertain previous owner. The RA's acquire step demands
-   positive evidence. A timeout, a failed ping, or a visible disk is not
-   evidence.
-2. **Fencing is verified, not requested.** "Accepted API request" is not
-   proof of fencing; "power is off" (or "reservation is mine") is.
-3. **Fencing precedes takeover in failure scenarios.** A hung export or a
-   wedged owner routes through fencing first. The SMP operations recover
-   *storage access*; fencing establishes *exclusivity*.
-4. **The shelf is a shared failure domain.** Both hosts losing the shelf
-   simultaneously is a whole-service outage; the design does not pretend
-   otherwise.
-5. **Disks are addressed by WWN/by-id, never /dev/sdX.** Enumeration differs
-   between hosts and across boots.
-6. **The VIP tears down before the pool.** With sharenfs, stopping the pool
-   while the VIP is up gives clients ESTALE errors; the ordering constraint
-   prevents this.
+1. **No import without exclusivity.** A node imports the HA pool only after a verified clean release by the previous owner, or after successful fencing of an uncertain previous owner. The RA's acquire step demands positive evidence. A timeout, a failed ping, or a visible disk is not evidence.
+2. **Fencing is verified, not requested.** "Accepted API request" is not proof of fencing; "power is off" (or "reservation is mine") is.
+3. **Fencing precedes takeover in failure scenarios.** A hung export or a wedged owner routes through fencing first. The SMP operations recover *storage access*; fencing establishes *exclusivity*.
+4. **The shelf is a shared failure domain.** Both hosts losing the shelf simultaneously is a whole-service outage; the design does not pretend otherwise.
+5. **Disks are addressed by WWN/by-id, never /dev/sdX.** Enumeration differs between hosts and across boots.
+6. **The VIP tears down before the pool.** With sharenfs, stopping the pool while the VIP is up gives clients ESTALE errors; the ordering constraint prevents this.
 
 ## Hardware notes - three paths, pick yours
 
-This is the decision that shapes everything else, so it gets its own section
-in the HOWTO with cabling diagrams. The short version:
+This is the decision that shapes everything else, so it gets its own section in the HOWTO with cabling diagrams. The short version:
 
-1. **SAS + interposers (best setup).** SATA disks behind *working* SAS
-   interposers present as dual-port SAS: no affiliation dance, SCSI PR
-   fencing, multipath. Recommended cabling is **one host per controller** -
-   each disk seen exactly once per host, no multipath needed. This is what
-   I recommend for a new build.
-2. **Interposer quality is everything.** Good interposers pass through the
-   drive's real serial and SAS address and run at full speed. Bad ones mask
-   the serial, fabricate SAS addresses, and collapse from 150 MB/s to under
-   2 MB/s under sustained load with constant reset storms. In my testing,
-   Emulex interposers worked; LSI ones did not. `docs/HOWTO.md` §12.2 has
-   the 30-second triage.
-3. **Plain SATA, single controller.** No interposers: one host cabled to one
-   controller, the other controller unplugged, the `stp` strategy (if the
-   shelf enforces affiliation) or the controlled cutover protocol (if it
-   does not). One mailbox SAS disk in the shelf is worth having even here -
-   it gives the cluster a second, disk-level confirmation path about peer
-   liveness.
+1. **SAS + interposers (best setup).** SATA disks behind *working* SAS interposers present as dual-port SAS: no affiliation dance, SCSI PR fencing, multipath. Recommended cabling is **one host per controller** - each disk seen exactly once per host, no multipath needed. This is what I recommend for a new build.
+2. **Interposer quality is everything.** Good interposers pass through the drive's real serial and SAS address and run at full speed. Bad ones mask the serial, fabricate SAS addresses, and collapse from 150 MB/s to under 2 MB/s under sustained load with constant reset storms. In my testing, Emulex interposers worked; LSI ones did not. `docs/HOWTO.md` §12.2 has the 30-second triage.
+3. **Plain SATA, single controller.** No interposers: one host cabled to one controller, the other controller unplugged, the `stp` strategy (if the shelf enforces affiliation) or the controlled cutover protocol (if it does not). One mailbox SAS disk in the shelf is worth having even here - it gives the cluster a second, disk-level confirmation path about peer liveness.
+
+I highly recommend interposers for SATA, if you need HA. I put a lot of time into trying to make that not the case, but that convinced me that they're good to have... especially if you have more than a few disks.  
 
 ## Comparison with ewwhite/zfs-ha (2019)
 
-The classic reference design (dual-port SAS, `fence_scsi`, `cachefile=none`,
-`sharenfs`, 7s failover) works because SAS disks make the hard problems
-disappear. This project solves those problems for SATA disks: the
-affiliation handoff machinery, MMP as a corruption backstop, evidence-based
-acquire, and boot-time quiesce. The `sharenfs` NFS failover approach is
-adopted from that design (it's the right way). With SAS disks, this
-project's `sas` strategy converges to the same simplicity.
+The classic reference design (dual-port SAS, `fence_scsi`, `cachefile=none`, `sharenfs`, 7s failover) works because SAS disks make the hard problems disappear. This project solves those problems for SATA disks: the affiliation handoff machinery, MMP as a corruption backstop, evidence-based acquire, and boot-time quiesce. The `sharenfs` NFS failover approach is adopted from that design (it's the right way). With SAS disks, this project's `sas` strategy converges to the same simplicity.
+
+https://github.com/ewwhite/zfs-ha/wiki
 
 ## License
 
