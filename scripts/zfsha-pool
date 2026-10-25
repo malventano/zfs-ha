@@ -401,6 +401,20 @@ def action_start(env):
 
 def action_stop(env):
     pool, disks = validate(env)
+    # V12 GUARD (VALIDATION V12/V14): a SUSPENDED pool must never be
+    # exported-and-quiesced. Exporting a suspended pool fails ("pool I/O
+    # is currently suspended"), and quiescing the devices underneath a
+    # suspended pool wedges every subsequent zpool command in D-state
+    # (txg_wait_synced to vdevs that no longer exist) - the only recovery
+    # is a host restart. The correct action is to fail fast and let
+    # pacemaker escalate to fencing: the fence agent isolates this host's
+    # storage access without touching the pool, and the peer acquires.
+    health = pool_health(pool)
+    if pool_imported(pool) and health == "SUSPENDED":
+        ocf_exit(OCF_ERR_GENERIC,
+                 f"pool {pool} is SUSPENDED (MMP) - refusing to stop: export "
+                 "would fail and quiescing the devices would wedge the host "
+                 "(V12). Fencing escalation required; do NOT quiesce devices.")
     try:
         os.unlink(ALLOW_FLAG)
     except FileNotFoundError:
@@ -423,9 +437,14 @@ def action_stop(env):
     run(["systemctl", "stop", "nfs-server"], timeout=60)
     r = run(["zpool", "export", pool], timeout=180)
     if r.returncode != 0:
+        # Export failed. Do NOT proceed to quiesce - the pool is still
+        # imported and its devices are live; deleting them now is the V12
+        # wedge. Fail fast; pacemaker will retry the stop, and if it keeps
+        # failing, escalate to fencing (stonith).
         ocf_exit(OCF_ERR_GENERIC,
                  f"zpool export failed (stuck export?): {r.stderr.strip()} - "
-                 "fencing required before takeover")
+                 "NOT quiescing devices (V12 guard): fencing required before "
+                 "takeover")
     for disk in disks:
         rc, out = handoff_op(env, "release", disk)
         if rc != 0:
