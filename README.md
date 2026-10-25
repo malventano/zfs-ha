@@ -37,9 +37,10 @@ all three disk paths and documents where each one is appropriate.
 **Status: working, validated end-to-end on real hardware.** The validation
 record (`docs/VALIDATION.md`) covers: the STP disk-handoff primitive (SATA
 affiliation release/acquire/recover, with data integrity checks, V2-V10),
-the cluster stack (corosync dual-ring, two-node quorum, V7), a pacemaker
-failover cutover with data verified intact on the new owner (V13 - partial:
-move-back, crash takeover, and fenced takeover are still pending), the
+the cluster stack (corosync dual-ring, two-node quorum, V7), a **full
+pacemaker failover matrix - planned move, crash takeover, and fenced
+takeover - all PASS with data verified** (V13-V15, including two
+recovery-path defects found and fixed during fenced takeover, V14), the
 SCSI persistent reservation path live-verified end to end (V11), the
 SUSPENDED-pool wedge failure mode and its lessons (V12), the controlled
 cutover protocol (three consecutive full round-trips of a 4x3TB raidz1,
@@ -186,11 +187,16 @@ move the pool back.
 ## Quick start
 
 ```sh
-# 1. prerequisites (both nodes) - see docs/HOWTO.md for the full version
+# 1. prerequisites (both nodes) - see docs/HOWTO.md §1 for the full version
 dnf install -y https://zfsonlinux.org/epel/zfs-release-2-8.el10.noarch.rpm
 dnf --enablerepo=zfs-kmod install -y zfs zfs-kmod
 dnf --enablerepo=highavailability install -y pacemaker corosync pcs resource-agents
-dnf install -y gcc make
+dnf install -y gcc make sg3_utils lsscsi
+# smp_utils is not packaged for EL10/Rocky 10 - build it (required by the
+# stp strategy and the shelf diagnostics):
+curl -skL https://sg.danny.cz/sg/p/smp_utils-0.99.tgz | tar xz -C /tmp
+cd /tmp/smp_utils-0.99 && ./configure --prefix=/usr/local && make -j4 && make install
+cd -
 make install   # builds smp_send, installs all tools to /usr/lib/zfs-ha
 
 # 2. cluster (first node only)
@@ -225,7 +231,7 @@ systemctl enable --now nfs-server
 
 # 7. Samba via a clustered-safe config (see HOWTO, HA Samba section)
 
-# 8. fencing - REQUIRED before the pool resource goes into pacemaker
+# 8. fencing - REQUIRED before the pool resource goes into pacemaker (see docs/FENCING.md)
 # 9. resources (configs/pacemaker-resources.txt)
 ```
 

@@ -136,7 +136,7 @@ role:
 | affiliations held, no pool imported | stale from crash | op=2 hard resets, then delete devices |
 | `discovery errors(sata affiliation conflict)` in dmesg | boot-time conflict | op=2 + `sg_reset -H` when promoted |
 
-## Invariants (unchanged from project-pre-notes)
+## Invariants
 
 1. No import without exclusivity: verified clean release **or** verified
    fencing.
@@ -201,7 +201,7 @@ pcs constraint order ha_pool then ha_vip kind=Mandatory
 pcs resource defaults update resource-stickiness=200
 ```
 
-Validated live: node loss (corosync stopped on primary) → pool+VIP stopped →
+Validated during development: node loss (corosync stopped on primary) → pool+VIP stopped →
 survivor cleaned up → RA start on survivor (rescan through udev quiesce,
 acquire with evidence, import) → VIP moved → data verified (sha256).
 
@@ -231,7 +231,7 @@ the pool import/export.
 zfs set sharenfs="rw=@<client-net>,sync,no_root_squash" <pool>/data
 ```
 
-**RA integration (v3):** stop = unmount sharenfs datasets + stop nfs-server +
+**RA integration:** stop = unmount sharenfs datasets + stop nfs-server +
 export; start = import + start nfs-server (sharenfs datasets auto-export).
 
 **Cutover timing (first failover, measured):** client wrote 1 record/second

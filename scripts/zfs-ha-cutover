@@ -47,7 +47,7 @@ CONF="${ZFS_HA_CONF:-/etc/zfs-ha/pool.conf}"
 SETTLE="${ZFS_HA_SETTLE:-2}"
 QUIESCE="${ZFS_HA_QUIESCE:-1}"
 RUN=/run/zfs-ha
-PEER_USER="${ZFS_HA_PEER_USER:-w}"
+PEER_USER="${ZFS_HA_PEER_USER:-root}"
 SSH_OPTS="-o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no"
 
 die() { echo "ERROR: $*" >&2; exit 1; }

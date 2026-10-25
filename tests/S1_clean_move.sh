@@ -42,6 +42,8 @@ ssh "$REMOTE" "for d in \$(zfs-ha-config get disks | tr ',' ' '); do
                zpool import -f $POOL"
 
 echo "step 4: verify writes on remote"
+# NOTE: write_client.py must exist at the same relative path on the remote
+# node (or adjust the path below). It is not installed by `make install`.
 ssh "$REMOTE" "python3 $(dirname "$0")/write_client.py verify --path $MOUNT/test.dat"
 
 echo "=== S1 PASS if verify says PASS ==="

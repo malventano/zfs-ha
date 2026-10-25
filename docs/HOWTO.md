@@ -207,9 +207,9 @@ start, and it refuses (exit 2) without them.
 > timeout at 300 s or higher (the resource template already uses 300 s).
 > A *primary-role* host starts immediately. If you want faster failovers
 > and accept the simultaneous-boot race handled purely by pacemaker +
-> fencing, lower `PEER_WAIT` (e.g. `PEER_WAIT=30 pcs resource ...` via the
-> RA's environment is not supported - edit the default in
-> `scripts/zfs-ha-role`).
+> fencing, lower `PEER_WAIT` - this requires editing the default in
+> `scripts/zfs-ha-role`; the RA's pacemaker environment is not consulted
+> for it.
 
 > [!WARNING]
 > `zpool create` can hang indefinitely on a shelf with marginal disks (it
@@ -452,10 +452,11 @@ Honest limitations, so you know what you're buying:
 
 This is the decision that shapes everything else. The `stp` path and the
 controlled cutover protocol are fully validated (see `docs/VALIDATION.md`);
-the `sas`/PR path is live-verified end to end (VALIDATION.md V11), though
-the full pacemaker-driven failover matrix for it is still pending (V11
-caveat, V13); the `null` path is designed, not validated. They are not
-equally proven, and the docs say which is which.
+the `sas`/PR path is live-verified end to end (VALIDATION.md V11), and the
+full pacemaker-driven failover matrix has since been executed and passed
+(V15) - two recovery-path defects found during it were fixed (V14); the
+`null` path is designed, not validated. They are not equally proven, and
+the docs say which is which.
 
 ### 12.1 SAS + interposers - the best setup (recommended)
 
@@ -481,12 +482,12 @@ With this topology:
 - the controllers arbitrate the fabric; a disk is reachable through either
   controller, but each initiator port has one path
 
-**We experimented with both hosts connected to both controllers** (each
+**I experimented with both hosts connected to both controllers** (each
 host dual-cabled). That works, but it makes multipath a concern: every
 physical disk appears twice per host (two sd devices, two SAS port
 addresses, one WWN), which is the single biggest source of "why do I see 10
 disks for 5 bays" confusion and is dangerous - handing ZFS the same
-physical disk twice silently corrupts the pool. **We do not recommend this
+physical disk twice silently corrupts the pool. **I do not recommend this
 topology.** If you must dual-cable (e.g. to survive a controller failure
 without failing over the whole host), §12.1b is mandatory.
 
@@ -567,8 +568,8 @@ zfs-ha-pr preempt <by-id> <victim-key>   # FENCED takeover from a dead owner
 ```
 
 Live-verified on the reference shelf (VALIDATION.md V11); the full
-pacemaker-driven failover matrix (preempt on dead owner, reservation
-surviving controller path failover) is still pending (V11 caveat, V13):
+pacemaker-driven failover matrix has since been executed and passed (V15),
+including preempt on a dead owner (V14):
 
 - Peer reads succeed while the owner holds the reservation (type 5 allows
   reads); peer writes fail with `reservation conflict` in dmesg and ZFS
@@ -671,7 +672,7 @@ ZFS_HA_PEER=<owner-ip> zfs-ha-cutover acquire
 
 Tunables (env): `ZFS_HA_SETTLE` (per-disk settle seconds, default 2),
 `ZFS_HA_QUIESCE=0` to skip device deletion (export-only cutover),
-`ZFS_HA_PEER_USER` (ssh user, default `w`). Requirements: passwordless ssh
+`ZFS_HA_PEER_USER` (ssh user, default `root`). Requirements: passwordless ssh
 between the hosts for the configured user.
 
 Validated: three consecutive full round-trips of the 4x3TB raidz1 pool

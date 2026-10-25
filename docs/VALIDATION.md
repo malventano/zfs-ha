@@ -11,9 +11,9 @@ Hardware used for validation (reference implementation):
 | ZFS | OpenZFS 2.2.11 (kmod) |
 | Cluster | pacemaker 3.0.1, corosync 3.1.10, pcs 0.12.2 |
 
-All tests were read-only or confined to a single sacrificial disk (bay 6,
-ST3000DM001) with marker writes to sector 100 only. No filesystems or pools
-were created on production data.
+V1-V8 were read-only or confined to a single sacrificial disk (bay 6,
+ST3000DM001) with marker writes to sector 100 only. V9 onward used
+dedicated sacrificial test pools (never production data).
 
 ## V1. Shelf topology discovery
 
@@ -217,7 +217,7 @@ not touch the disks after step 2 (stop smartd/udisks2 or fence it).
 
 ### 6. Data integrity
 
-Across all the churn in this session (multiple imports/exports, phy resets,
+Across all of this testing (multiple imports/exports, phy resets,
 MMP suspends, one host power cycle), every sha256 verification of the 5GB
 test dataset passed. No corruption at any point.
 
@@ -244,7 +244,7 @@ disks behind interposers, one host per controller.
   pacemaker-driven `fencing=pr` failover matrix (preempt on dead owner,
   reservation surviving controller path failover) is still pending - the
   reference cluster's failover testing was interrupted by an unrelated
-  host wedge (see V12).
+  host wedge (see V12). (Superseded: the matrix was completed - see V15.)
 
 ## V12. SUSPENDED-pool-with-deleted-devices wedge (known failure mode)
 
@@ -262,7 +262,7 @@ outgoing owner's pool suspended (MMP) and the RA then deleted the devices
 Consequences for the design:
 
 1. The RA must not quiesce devices while the pool is SUSPENDED - that
-   state requires fencing escalation, not device deletion. (Not yet implemented as a check;
+   state requires fencing escalation, not device deletion. (Implemented since this entry -
    current RA exports first and only quiesces after a clean export, so
    this window requires the export to have already failed/suspended.)
 2. A failed stop must escalate to fencing (pacemaker does this naturally
@@ -286,7 +286,7 @@ fence_zfs_ha_stp stonith resource, ha_pool (ocf:zfsha:Pool) + ha_vip
   the 180s PEER_WAIT window after a peer failure.
 - Incomplete: the full move matrix (move back, crash-of-owner takeover,
   fenced takeover) was interrupted by the V12 wedge and the manual host
-  restart. To be completed.
+  restart. (Superseded: the full matrix was completed - see V15.)
 
 ## V14. Fenced takeover - found and fixed two recovery-path defects
 
@@ -329,7 +329,7 @@ stonith, ha_pool ocf:zfsha:Pool + ha_vip IPaddr2):
 
 | Leg | Result |
 |---|---|
-| Planned move .8 -> .52 -> .8 | PASS - clean export/acquire/import both ways, PR reservation taken/released, data verified |
+| Planned move node A -> node B -> node A | PASS - clean export/acquire/import both ways, PR reservation taken/released, data verified |
 | Crash of owner (kernel panic) | PASS - peer detected, took over; owner rejoined and cluster reconverged |
 | Fenced takeover (stonith fence of live owner) | PASS - fence cleared all owner affiliations at the shelf, fenced host's pacemaker self-terminated, peer acquired + imported, data verified (marker written pre-fence read back post-fence) |
 
@@ -338,8 +338,8 @@ event and read back after; `zpool status` clean (0 errors) throughout.
 
 Operational notes from the runs (all fixed or documented):
 
-- The VIP resource's `nic=` parameter is host-specific (enp7s0 on .8,
-  enp1s0 on .52). When the VIP fails over to a host with a different NIC
+- The VIP resource's `nic=` parameter is host-specific (the two nodes had
+  different client-facing NIC names). When the VIP fails over to a host with a different NIC
   name, update the parameter (`pcs resource update ha_vip nic=<nic>`) or
   use a resource with per-node instance attributes. Documented in the
   HOWTO operations section.

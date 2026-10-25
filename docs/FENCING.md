@@ -91,10 +91,11 @@ Understand what it is and is not:
   (BMC/PDU/PiKVM) when the hardware has one.
 - It only applies to the `stp` path (SATA disks with STP affiliations). The
   `sas` path fences with SCSI persistent reservations instead (`zfs-ha-pr`).
-- **The `off` action has not yet been exercised in a live fence** on the
-  reference cluster (see VALIDATION.md V13) - it was configured as a stonith
-  resource but never fired against a real failure. Per the rule below, treat
-  it as untested until you have run the fence test yourself.
+- **Exercised live in the V15 failover matrix**: the fence cleared all of
+  the owner's disk affiliations and the fenced host's pacemaker
+  self-terminated as designed. The mandatory test below still applies to
+  *your* hardware - a fence agent that has never been tested on your shelf
+  is a liability, not a safety net.
 
 Setup:
 
