@@ -320,3 +320,32 @@ Recovery sequence that converged (documented for operators):
 phy hard reset on peer-affiliated phys -> clear the dead owner's PR
 registration (clear --param-rk=<victim-key>) -> rescan with allow-import
 held -> zpool import -f -> pcs resource cleanup.
+
+## V15. Fenced takeover - full matrix PASS
+
+Date: 2026-10-24. Complete failover matrix, all legs executed on the
+reference cluster (corosync dual-ring, two-node quorum, fence_zfs_ha_stp
+stonith, ha_pool ocf:zfsha:Pool + ha_vip IPaddr2):
+
+| Leg | Result |
+|---|---|
+| Planned move .8 -> .52 -> .8 | PASS - clean export/acquire/import both ways, PR reservation taken/released, data verified |
+| Crash of owner (kernel panic) | PASS - peer detected, took over; owner rejoined and cluster reconverged |
+| Fenced takeover (stonith fence of live owner) | PASS - fence cleared all owner affiliations at the shelf, fenced host's pacemaker self-terminated, peer acquired + imported, data verified (marker written pre-fence read back post-fence) |
+
+Data integrity: every leg verified with marker files written before the
+event and read back after; `zpool status` clean (0 errors) throughout.
+
+Operational notes from the runs (all fixed or documented):
+
+- The VIP resource's `nic=` parameter is host-specific (enp7s0 on .8,
+  enp1s0 on .52). When the VIP fails over to a host with a different NIC
+  name, update the parameter (`pcs resource update ha_vip nic=<nic>`) or
+  use a resource with per-node instance attributes. Documented in the
+  HOWTO operations section.
+- Root-to-root ssh between the hosts is required by the role-arbitration
+  cross-check (zfs-ha-role verifies the peer actually has the pool
+  imported before standing down). Exchange root keys during setup.
+- The V12 guard (RA refuses to quiesce a SUSPENDED pool or quiesce after
+  a failed export) held: no wedge occurred during the matrix legs after
+  it was deployed.
