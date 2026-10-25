@@ -201,7 +201,7 @@ This is the decision that shapes everything else, so it gets its own section in 
 
 1. **SAS + interposers (best setup).** SATA disks behind *working* SAS interposers present as dual-port SAS: no affiliation dance, SCSI PR fencing, multipath. Recommended cabling is **one host per controller** - each disk seen exactly once per host, no multipath needed. This is what I recommend for a new build.
 2. **Interposer quality is everything.** Good interposers pass through the drive's real serial and SAS address and run at full speed. Bad ones mask the serial, fabricate SAS addresses, and collapse from 150 MB/s to under 2 MB/s under sustained load with constant reset storms. In my testing, Emulex interposers worked; LSI ones did not. `docs/HOWTO.md` §12.2 has the 30-second triage.
-3. **Plain SATA, single controller.** No interposers: one host cabled to one controller, the other controller unplugged, the `stp` strategy (if the shelf enforces affiliation) or the controlled cutover protocol (if it does not). One mailbox SAS disk in the shelf is worth having even here - it gives the cluster a second, disk-level confirmation path about peer liveness.
+3. **Plain SATA, single controller.** No interposers: both hosts cabled to one controller, the other controller unplugged, the `stp` strategy (if the shelf enforces affiliation) or the controlled cutover protocol (if it does not). One mailbox SAS disk in the shelf is worth having even here - it gives the cluster a second, disk-level confirmation path about peer liveness.
 
 I highly recommend interposers for SATA, if you need HA. I put a lot of time into trying to make that not the case, but that convinced me that they're good to have... especially if you have more than a few disks.  
 
