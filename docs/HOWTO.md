@@ -828,6 +828,16 @@ without needing to know this repo exists.
 - **Adding disks**: create the pool with all disks it will ever need, or
   add vdevs while both hosts can see the new disks (they will - the shelf
   is shared). Never split a pool across shelves.
+- **VIP nic= is host-specific.** The ha_vip resource's `nic=` parameter
+  must match the client-facing NIC name on whichever node the VIP lands
+  on (they can differ between nodes - e.g. `enp7s0` vs `enp1s0`). If a
+  failover lands the VIP on a node with a different NIC name, update it:
+  `pcs resource update ha_vip nic=<nic>`. (Found live during the V15
+  matrix.)
+- **Root-to-root ssh is required**, not just user-level: the role
+  arbitration cross-check (`zfs-ha-role`) verifies over ssh that the peer
+  actually has the pool imported before standing down. Exchange root
+  keys (`ssh-copy-id root@<peer>` from each host's root account).
 - **Monitoring**: `zpool status -x`, `pcs status`, `corosync-cfgtool -s`,
   SES enclosure health (`utils/shelf-health.py`), and the topology
   (`utils/sas_topology.sh`) when a disk misbehaves.
